@@ -90,29 +90,40 @@ def _scatter_tokens_kernel(
 
     for token_idx_i32 in range(start_token, num_tokens, grid_size):
         token_idx = token_idx_i32.to(tl.int64)
-
-        in_data = tl.load(
-            hidden_states_ptr + token_idx * stride_hs_m + h_offs,
-            mask=h_mask,
-        )
-
         topk_base = token_idx_i32 * topk
-        for k in range(topk):
-            expert_id = tl.load(topk_ids_ptr + topk_base + k)
-            local_id = expert_id - start_expert
 
-            if local_id >= 0 and local_id < num_groups:
-                pos = tl.atomic_add(write_counters_ptr + local_id, 1)
-                m_offset = tl.load(packed_layout_ptr + local_id)
-                dst_row = (m_offset + pos).to(tl.int64)
+        # Pre-check: does this token have any local experts?
+        any_local: tl.int32 = 0
+        for kk in tl.static_range(topk):
+            eid = tl.load(topk_ids_ptr + topk_base + kk)
+            lid = eid - start_expert
+            any_local |= ((lid >= 0) & (lid < num_groups)).to(tl.int32)
 
-                tl.store(output_index_ptr + topk_base + k, (m_offset + pos))
-                tl.store(
-                    sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
-                    in_data,
-                    mask=h_mask,
-                )
-            else:
+        if any_local != 0:
+            in_data = tl.load(
+                hidden_states_ptr + token_idx * stride_hs_m + h_offs,
+                mask=h_mask,
+            )
+
+            for k in range(topk):
+                expert_id = tl.load(topk_ids_ptr + topk_base + k)
+                local_id = expert_id - start_expert
+
+                if local_id >= 0 and local_id < num_groups:
+                    pos = tl.atomic_add(write_counters_ptr + local_id, 1)
+                    m_offset = tl.load(packed_layout_ptr + local_id)
+                    dst_row = (m_offset + pos).to(tl.int64)
+
+                    tl.store(output_index_ptr + topk_base + k, (m_offset + pos))
+                    tl.store(
+                        sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
+                        in_data,
+                        mask=h_mask,
+                    )
+                else:
+                    tl.store(output_index_ptr + topk_base + k, -1)
+        else:
+            for k in tl.static_range(topk):
                 tl.store(output_index_ptr + topk_base + k, -1)
 
 
