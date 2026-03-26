@@ -308,14 +308,10 @@ def moe_gather(
     flat_weights = topk_weights.view(-1)
     flat_index = output_index.view(-1)
 
-    output = torch.zeros(bs, out_dim, device=gemm_output.device, dtype=gemm_output.dtype)
+    output = torch.empty(bs, out_dim, device=gemm_output.device, dtype=gemm_output.dtype)
 
-    # Try different BLOCK_D values for best performance
     if out_dim % 512 == 0:
         BLOCK_D = 512
-        num_warps = 4
-    elif out_dim % 256 == 0:
-        BLOCK_D = 256
         num_warps = 4
     elif out_dim % 128 == 0:
         BLOCK_D = 128

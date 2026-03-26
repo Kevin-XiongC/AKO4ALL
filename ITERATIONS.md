@@ -10,6 +10,7 @@
 | 3 | tiled gather (1D grid) | 0.0407 | 0.0435 | 0.0842 | regression — reverted |
 | 4 | gather BLOCK_D=512, num_warps=4 | 0.0407 | 0.0329 | 0.0736 | improved |
 | 5 | wrapper optimizations | 0.0407 | 0.0331 | 0.0738 | no change |
+| 6 | torch.empty + BLOCK_D tuning | 0.0408 | 0.0309 | 0.0718 | improved |
 
 ## Iterations
 
