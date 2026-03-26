@@ -14,3 +14,4 @@
 | 7 | static_range + remove redundant -1 stores | 0.0239 | 0.0115 | 0.0354 | worse — excessive unrolling, reverted |
 | 8 | Single-pass count kernel (TOTAL<=16384) | 0.0203 | 0.0113 | 0.0316 | improved -7.1% — count kernel much faster |
 | 9 | Atomic on packed_layout (remove m_offset load) | 0.0212 | 0.0113 | 0.0325 | slightly worse, reverted |
+| 10 | Gather evict_first output stores | 0.0208 | 0.0116 | 0.0324 | gather worse, reverted |
