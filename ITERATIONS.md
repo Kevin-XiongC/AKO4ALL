@@ -28,6 +28,7 @@
 | 21 | + scatter write evict_first | 0.0292 | 0.0174 | 0.0466 | stable best |
 | 22 | evict_last on metadata reads | 0.0289 | 0.0168 | 0.0457 | improved |
 | 23 | count kernel evict_last topk_ids | 0.0276 | 0.0168 | 0.0445 | improved |
+| 24 | scatter topk_ids evict_last | 0.0281 | 0.0166 | 0.0447 | neutral |
 
 ## Iterations
 
