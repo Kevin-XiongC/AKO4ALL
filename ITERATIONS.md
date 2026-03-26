@@ -14,3 +14,4 @@
 | 7 | Scatter evict_first on data writes / gather BLOCK_D=512 / stages=2 | varies | varies | 0.0357-0.0368 | all worse, reverted to iter 6 |
 | 8 | Full-row gather BLOCK_D=8192 + various | 0.0239 | 0.0119 | 0.0358 | worse gather — fewer blocks hurts |
 | 9 | Gather evict_first on store + confirmation runs | 0.0236 | 0.0114 | 0.0350 | best confirmed, evict_first on store hurts |
+| 10 | Pre-load m_offset before atomic_add | 0.0230 | 0.0112 | 0.0342 | **improved** — latency overlap |

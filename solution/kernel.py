@@ -2,13 +2,12 @@
 Triton kernels for MoE token scatter/gather with DeepGEMM m-offset layout.
 
 Optimizations applied (H200):
-  - tl.histogram replaces O(BLOCK_SIZE * BLOCK_G) inner loop in count kernel
-  - BLOCK_SIZE=8192 for count kernel (single pass, no loop)
-  - 2-pass scatter: lightweight position allocation + 2D data copy kernel
-  - 2D scatter grid (hidden_chunks x tokens) for 5x more parallelism on H200
-  - L2 cache eviction policies
-  - torch.empty instead of torch.zeros for output buffers
-  - BLOCK_D=1024 / num_warps=8 / num_stages=1 for gather kernel
+  - tl.histogram in count kernel
+  - No eviction policies on scatter/count (H200 defaults better)
+  - tl.static_range for topk loop
+  - Pre-check for non-local tokens
+  - Gather: evict_last on reads, BLOCK_D=1024, num_warps=4, grid tokens=512
+  - torch.empty for output buffers
 """
 
 import math
@@ -82,14 +81,11 @@ def _scatter_positions_kernel(
 
             if local_id >= 0 and local_id < num_groups:
                 pos = tl.atomic_add(write_counters_ptr + local_id, 1)
-                m_offset = tl.load(packed_layout_ptr + local_id,
-                                   eviction_policy="evict_last")
+                m_offset = tl.load(packed_layout_ptr + local_id)
                 tl.store(output_index_ptr + topk_base + k,
-                         (m_offset + pos),
-                         eviction_policy="evict_last")
+                         (m_offset + pos))
             else:
-                tl.store(output_index_ptr + topk_base + k, -1,
-                         eviction_policy="evict_first")
+                tl.store(output_index_ptr + topk_base + k, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +122,6 @@ def _scatter_data_kernel(
         if any_local:
             in_data = tl.load(
                 hidden_states_ptr + token_idx * stride_hs_m + h_offs,
-                eviction_policy="evict_last",
             )
 
             for k in tl.static_range(topk):
@@ -136,12 +131,11 @@ def _scatter_data_kernel(
                     tl.store(
                         sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
                         in_data,
-                        eviction_policy="evict_first",
                     )
 
 
 # ---------------------------------------------------------------------------
-# Keep the old scatter kernel name for API compatibility (bench imports it)
+# Kernel 2 — scatter tokens (bench calls this directly)
 # ---------------------------------------------------------------------------
 
 @triton.jit
@@ -189,8 +183,9 @@ def _scatter_tokens_kernel(
                 local_id = expert_id - start_expert
 
                 if local_id >= 0 and local_id < num_groups:
-                    pos = tl.atomic_add(write_counters_ptr + local_id, 1)
+                    # Pre-load m_offset before atomic to overlap latency
                     m_offset = tl.load(packed_layout_ptr + local_id)
+                    pos = tl.atomic_add(write_counters_ptr + local_id, 1)
                     dst_row = (m_offset + pos).to(tl.int64)
 
                     tl.store(output_index_ptr + topk_base + k,
@@ -228,13 +223,13 @@ def _gather_tokens_kernel(
     grid_tokens = tl.num_programs(1)
 
     d_offs = tl.arange(0, BLOCK_D)
+    base_addr = block_idx * BLOCK_D
 
     for token_idx_i32 in range(start_token, num_tokens, grid_tokens):
         token_idx = token_idx_i32.to(tl.int64)
         topk_base = token_idx_i32 * topk
 
         acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-        base_addr = block_idx * BLOCK_D
 
         for k in tl.static_range(topk):
             src_row_i32 = tl.load(output_index_ptr + topk_base + k,
@@ -286,8 +281,7 @@ def moe_align_and_scatter(
     flat_topk_ids = topk_ids.view(-1)
 
     packed_layout = torch.empty(2 * num_groups, dtype=torch.int32, device=device)
-    # Use large BLOCK_SIZE to process all elements in 1-2 iterations
-    BLOCK_SIZE = min(8192, triton.next_power_of_2(num_elements))
+    BLOCK_SIZE = min(4096, triton.next_power_of_2(num_elements))
     BLOCK_G = triton.next_power_of_2(num_groups)
     NUM_ITERS = math.ceil(num_elements / BLOCK_SIZE)
     _count_and_compute_layout_kernel[(1,)](
@@ -303,7 +297,7 @@ def moe_align_and_scatter(
     write_counters = torch.zeros(num_groups, dtype=torch.int32, device=device)
     output_index = torch.empty(bs * topk, dtype=torch.int32, device=device)
 
-    # Pass 1: Position allocation (lightweight, no data movement)
+    # Pass 1: Position allocation
     pos_grid = min(bs, 1024)
     _scatter_positions_kernel[(pos_grid,)](
         flat_topk_ids, packed_layout, write_counters, output_index,
@@ -311,7 +305,7 @@ def moe_align_and_scatter(
         num_warps=4,
     )
 
-    # Pass 2: Data copy (2D grid: hidden_chunks x tokens)
+    # Pass 2: Data copy (2D grid)
     BLOCK_H = 1024
     if hidden_dim % BLOCK_H != 0:
         BLOCK_H = 128
@@ -323,7 +317,7 @@ def moe_align_and_scatter(
         bs, topk,
         hidden_states.stride(0), sorted_hidden.stride(0),
         BLOCK_H=BLOCK_H,
-        num_warps=8,
+        num_warps=4,
     )
 
     return sorted_hidden, packed_layout, output_index
