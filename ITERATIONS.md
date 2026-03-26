@@ -12,6 +12,7 @@
 | 6 | Merge write+clear + read from allreduce_in | 0.97x | 0.1363 | regression |
 | 7 | Move oneshot clear after poll+fused_op | 1.01x | 0.1312 | no-change |
 | 8 | Lower oneshot threshold for 8 GPUs | **1.23x** | **0.1078** | **improved** |
+| 9 | Fine-tune threshold (3MB, 10MB) | — | — | threshold=5MB confirmed optimal |
 
 ## Key Improvement: Iter 8
 
@@ -23,6 +24,10 @@ The Python-side oneshot/twoshot threshold for 8 GPUs was 42MB (≈268 tokens), m
 - Large tokens (512+): unchanged
 
 The 8-rank Lamport polling is fundamentally inefficient: each rank writes to 8 buffers then polls 8 remote entries per element with volatile loads. The twoshot's structured scatter-reduce-allgather with barriers is much more efficient for these message sizes.
+
+### Iter 9 — Fine-tune threshold
+
+Tested threshold=3MB (token 32 twoshot → terrible, 9.1 GB/s, only 4 blocks) and threshold=10MB (token 64 oneshot → 13% worse than twoshot). **Threshold=5MB is optimal** for our token range: tokens 16-32 oneshot, 64+ twoshot.
 
 ## Iterations 1-7 (see git history)
 Only iter 2 (native bf16 __hadd2) improved (1.5%). All NVLink restructuring attempts (iters 1,3,4,5,6,7) regressed or were neutral, confirming the twoshot algorithm is well-optimized.
