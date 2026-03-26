@@ -18,6 +18,7 @@
 | 11 | remove eviction policy + BLOCK_D=1024 | 0.0369 | 0.0302 | 0.0671 | best |
 | 12 | num_stages=3 gather | 0.0369 | 0.0307 | 0.0676 | no change |
 | 13 | num_warps=16 / pytorch gather | 0.0369 | 0.0332/0.247 | 0.0701 | regression |
+| 14 | inline tiled scatter writes | 0.0425 | 0.0307 | 0.0732 | regression — reverted |
 
 ## Iterations
 
