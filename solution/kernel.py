@@ -20,7 +20,7 @@ FP8_E4M3_MAX = 448.0
 # ---------------------------------------------------------------------------
 
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=8, num_stages=1)],
+    configs=[triton.Config({}, num_warps=16, num_stages=1)],
     key=['BLOCK_SIZE'],
 )
 @triton.jit
