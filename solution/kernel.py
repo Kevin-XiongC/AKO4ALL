@@ -102,6 +102,10 @@ def _scatter_quantize_kernel(
     HIDDEN_SIZE: tl.constexpr,
     HIDDEN_SIZE_PAD: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    GROUP_SIZE: tl.constexpr = 0,
+    NUM_GROUPS_PER_ROW: tl.constexpr = 1,
+    NUM_GROUPS_PER_ROW_PAD: tl.constexpr = 1,
+    STRIDE_SC_M: tl.constexpr = 1,
 ):
     start_token = tl.program_id(0)
     grid_size = tl.num_programs(0)
@@ -127,25 +131,53 @@ def _scatter_quantize_kernel(
                 other=0.0,
             )
 
-            # FP8 per-token quantization: find max abs → compute scale → quantize
             in_f32 = in_data.to(tl.float32)
-            max_val = tl.max(tl.where(h_mask, tl.abs(in_f32), 0.0))
-            scale = max_val / FP8_MAX
-            scale_inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
-            quantized = in_f32 * scale_inv
-            fp8_data = quantized.to(tl.float8e4nv)
 
-            # Store FP8 data + scale for each local expert destination
-            for k in tl.static_range(topk):
-                dst_row_i32 = tl.load(output_index_ptr + topk_base + k)
-                if dst_row_i32 >= 0:
-                    dst_row = dst_row_i32.to(tl.int64)
-                    tl.store(
-                        sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
-                        fp8_data,
-                        mask=h_mask,
-                    )
-                    tl.store(sorted_scales_ptr + dst_row, scale)
+            if GROUP_SIZE > 0:
+                # Per-group FP8 quantization
+                in_2d = tl.reshape(in_f32, (NUM_GROUPS_PER_ROW_PAD, GROUP_SIZE))
+                abs_2d = tl.abs(in_2d)
+                max_per_group = tl.max(abs_2d, axis=1)
+                scales = max_per_group / FP8_MAX
+                scale_invs = tl.where(scales > 0.0, 1.0 / scales, 0.0)
+                quantized_2d = in_2d * tl.reshape(scale_invs, (NUM_GROUPS_PER_ROW_PAD, 1))
+                fp8_2d = quantized_2d.to(tl.float8e4nv)
+                fp8_data = tl.reshape(fp8_2d, (HIDDEN_SIZE_PAD,))
+
+                g_offs = tl.arange(0, NUM_GROUPS_PER_ROW_PAD)
+                g_mask = g_offs < NUM_GROUPS_PER_ROW
+
+                for k in tl.static_range(topk):
+                    dst_row_i32 = tl.load(output_index_ptr + topk_base + k)
+                    if dst_row_i32 >= 0:
+                        dst_row = dst_row_i32.to(tl.int64)
+                        tl.store(
+                            sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
+                            fp8_data,
+                            mask=h_mask,
+                        )
+                        tl.store(
+                            sorted_scales_ptr + dst_row * STRIDE_SC_M + g_offs,
+                            scales,
+                            mask=g_mask,
+                        )
+            else:
+                # Per-token FP8 quantization
+                max_val = tl.max(tl.where(h_mask, tl.abs(in_f32), 0.0))
+                scale = max_val / FP8_MAX
+                scale_inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
+                fp8_data = (in_f32 * scale_inv).to(tl.float8e4nv)
+
+                for k in tl.static_range(topk):
+                    dst_row_i32 = tl.load(output_index_ptr + topk_base + k)
+                    if dst_row_i32 >= 0:
+                        dst_row = dst_row_i32.to(tl.int64)
+                        tl.store(
+                            sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
+                            fp8_data,
+                            mask=h_mask,
+                        )
+                        tl.store(sorted_scales_ptr + dst_row, scale)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +202,10 @@ def _scatter_tokens_kernel(
     HIDDEN_SIZE_PAD: tl.constexpr,
     sorted_scales_ptr=None,
     FP8_MAX: tl.constexpr = 448,
+    GROUP_SIZE: tl.constexpr = 0,
+    NUM_GROUPS_PER_ROW: tl.constexpr = 1,
+    NUM_GROUPS_PER_ROW_PAD: tl.constexpr = 1,
+    STRIDE_SC_M: tl.constexpr = 1,
 ):
     start_token = tl.program_id(0)
     grid_size = tl.num_programs(0)
@@ -195,12 +231,27 @@ def _scatter_tokens_kernel(
                 other=0.0,
             )
 
-            # FP8 per-token quantization
             in_f32 = in_data.to(tl.float32)
-            max_val = tl.max(tl.where(h_mask, tl.abs(in_f32), 0.0))
-            scale = max_val / FP8_MAX
-            scale_inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
-            fp8_data = (in_f32 * scale_inv).to(tl.float8e4nv)
+
+            if GROUP_SIZE > 0:
+                # Per-group FP8 quantization
+                in_2d = tl.reshape(in_f32, (NUM_GROUPS_PER_ROW_PAD, GROUP_SIZE))
+                abs_2d = tl.abs(in_2d)
+                max_per_group = tl.max(abs_2d, axis=1)
+                scales = max_per_group / FP8_MAX
+                scale_invs = tl.where(scales > 0.0, 1.0 / scales, 0.0)
+                quantized_2d = in_2d * tl.reshape(scale_invs, (NUM_GROUPS_PER_ROW_PAD, 1))
+                fp8_2d = quantized_2d.to(tl.float8e4nv)
+                fp8_data = tl.reshape(fp8_2d, (HIDDEN_SIZE_PAD,))
+
+                g_offs = tl.arange(0, NUM_GROUPS_PER_ROW_PAD)
+                g_mask = g_offs < NUM_GROUPS_PER_ROW
+            else:
+                # Per-token FP8 quantization
+                max_val = tl.max(tl.where(h_mask, tl.abs(in_f32), 0.0))
+                scale = max_val / FP8_MAX
+                scale_inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
+                fp8_data = (in_f32 * scale_inv).to(tl.float8e4nv)
 
             for k in range(topk):
                 expert_id = tl.load(topk_ids_ptr + topk_base + k)
@@ -218,7 +269,14 @@ def _scatter_tokens_kernel(
                         fp8_data,
                         mask=h_mask,
                     )
-                    tl.store(sorted_scales_ptr + dst_row, scale)
+                    if GROUP_SIZE > 0:
+                        tl.store(
+                            sorted_scales_ptr + dst_row * STRIDE_SC_M + g_offs,
+                            scales,
+                            mask=g_mask,
+                        )
+                    else:
+                        tl.store(sorted_scales_ptr + dst_row, scale)
                 else:
                     tl.store(output_index_ptr + topk_base + k, -1)
         else:
@@ -293,21 +351,30 @@ def moe_align_and_scatter(
     start_expert: int,
     max_total_M: int | None = None,
     alignment: int = ALIGNMENT,
+    group_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Reorder tokens by expert assignment for DeepGEMM m-offset layout,
-    with fused FP8 per-token quantization.
+    with fused FP8 quantization (per-token or per-group).
+
+    Args:
+        group_size: If None, per-token quantization. Otherwise per-group.
 
     Returns:
         sorted_hidden: [max_total_M, hidden_dim]  FP8 e4m3fn quantized activations
         packed_layout: [2 * num_groups]            [m_offsets | m_counts]
         output_index:  [bs * topk]                 reverse mapping (-1 for non-local)
-        sorted_scales: [max_total_M]               per-row FP8 scale (float32)
+        sorted_scales: per-token: [max_total_M]  |  per-group: [max_total_M, hidden_dim // group_size]
     """
     bs, hidden_dim = hidden_states.shape
     topk = topk_ids.shape[1]
     num_elements = bs * topk
     device = hidden_states.device
+
+    use_per_group = group_size is not None and group_size < hidden_dim
+    if use_per_group:
+        assert hidden_dim % group_size == 0
+        num_scale_cols = hidden_dim // group_size
 
     if max_total_M is None:
         max_total_M = num_elements + num_groups * (alignment - 1)
@@ -330,7 +397,10 @@ def moe_align_and_scatter(
     sorted_hidden = torch.empty(
         max_total_M, hidden_dim, device=device, dtype=torch.float8_e4m3fn,
     )
-    sorted_scales = torch.zeros(max_total_M, device=device, dtype=torch.float32)
+    if use_per_group:
+        sorted_scales = torch.zeros(max_total_M, num_scale_cols, device=device, dtype=torch.float32)
+    else:
+        sorted_scales = torch.zeros(max_total_M, device=device, dtype=torch.float32)
     write_counters = torch.zeros(num_groups, dtype=torch.int32, device=device)
     output_index = torch.empty(bs * topk, dtype=torch.int32, device=device)
 
@@ -345,12 +415,26 @@ def moe_align_and_scatter(
     # Kernel 2b: Fused FP8 quantize + data copy (1D, full row)
     HIDDEN_SIZE_PAD = triton.next_power_of_2(hidden_dim)
     grid_size = min(bs, 1024)
+
+    if use_per_group:
+        gs = group_size
+        NGR = num_scale_cols
+        NGR_PAD = HIDDEN_SIZE_PAD // gs
+    else:
+        gs = 0
+        NGR = 1
+        NGR_PAD = 1
+
     _scatter_quantize_kernel[(grid_size,)](
         hidden_states, sorted_hidden, sorted_scales, output_index,
         bs, topk,
         hidden_states.stride(0), sorted_hidden.stride(0),
         HIDDEN_SIZE=hidden_dim, HIDDEN_SIZE_PAD=HIDDEN_SIZE_PAD,
         FP8_MAX=FP8_E4M3_MAX,
+        GROUP_SIZE=gs,
+        NUM_GROUPS_PER_ROW=NGR,
+        NUM_GROUPS_PER_ROW_PAD=NGR_PAD,
+        STRIDE_SC_M=sorted_scales.stride(0) if use_per_group else 1,
         num_warps=8,
     )
 

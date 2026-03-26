@@ -42,13 +42,19 @@ PRIMARY_BS = 1024
 FP8_E4M3_MAX = 448.0
 
 CORRECTNESS_CONFIGS = [
-    # (bs, topk, num_experts, num_groups, hidden_dim)
-    (128,  2,  64,  8, 4096),
-    (512,  4, 256, 32, 7168),
-    (1024, 2,  64,  8, 4096),
-    (64,   8, 128, 16, 3072),
-    (256,  2, 256, 32, 4096),
-    (128,  6, 160, 20, 5120),
+    # (bs, topk, num_experts, num_groups, hidden_dim, group_size)
+    # Per-token (group_size=None)
+    (128,  2,  64,  8, 4096, None),
+    (512,  4, 256, 32, 7168, None),
+    (1024, 2,  64,  8, 4096, None),
+    (64,   8, 128, 16, 3072, None),
+    (256,  2, 256, 32, 4096, None),
+    (128,  6, 160, 20, 5120, None),
+    # Per-group (group_size=128)
+    (128,  2,  64,  8, 4096, 128),
+    (512,  4, 256, 32, 7168, 128),
+    (64,   8, 128, 16, 3072, 128),
+    (128,  6, 160, 20, 5120, 128),
 ]
 
 BENCH_BS_VALS = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
@@ -71,11 +77,20 @@ def _sort_rows(rows, proj):
 # Correctness checks
 # ---------------------------------------------------------------------------
 
+def _dequant_row(s_row, sc_row, group_size):
+    """Dequantize a single FP8 row using per-token or per-group scales."""
+    if group_size is not None:
+        # sc_row is [num_scale_cols], expand to [hidden_dim]
+        return s_row.float() * sc_row.repeat_interleave(group_size)
+    else:
+        return s_row.float() * sc_row.item()
+
+
 def check_scatter_correctness(sol_mod, ref_mod, verbose=False):
     """Returns True if all scatter tests pass (FP8 output)."""
     ALIGNMENT = getattr(sol_mod, "ALIGNMENT", 128)
 
-    for bs, topk, num_experts, num_groups, hidden_dim in CORRECTNESS_CONFIGS:
+    for bs, topk, num_experts, num_groups, hidden_dim, group_size in CORRECTNESS_CONFIGS:
         start_expert = (num_experts - num_groups) // 2
         torch.manual_seed(42)
         hidden_states = torch.randn(bs, hidden_dim, device="cuda", dtype=torch.bfloat16)
@@ -84,9 +99,11 @@ def check_scatter_correctness(sol_mod, ref_mod, verbose=False):
 
         s_tri, p_tri, i_tri, sc_tri = sol_mod.moe_align_and_scatter(
             hidden_states, topk_ids, num_groups, start_expert, max_total_M,
+            group_size=group_size,
         )
         s_ref, p_ref, i_ref, sc_ref = ref_mod.ref_moe_align_and_scatter(
             hidden_states, topk_ids, num_groups, start_expert, max_total_M,
+            group_size=group_size,
         )
 
         # Check packed_layout
@@ -115,7 +132,7 @@ def check_scatter_correctness(sol_mod, ref_mod, verbose=False):
                     return False
                 tok = i // topk
                 src = hidden_states[tok].float()
-                dst_dequant = s_tri[row].float() * sc_tri[row].item()
+                dst_dequant = _dequant_row(s_tri[row], sc_tri[row], group_size)
                 rel_err = (dst_dequant - src).abs().max().item() / (src.abs().max().item() + 1e-8)
                 if rel_err > 0.1:
                     if verbose:
@@ -127,9 +144,10 @@ def check_scatter_correctness(sol_mod, ref_mod, verbose=False):
                         print(f"  FAIL scatter output_index[{i}] should be -1")
                     return False
 
+        mode_str = f"group={group_size}" if group_size else "per-token"
         if verbose:
             print(f"  scatter OK  bs={bs}, topk={topk}, experts={num_experts}, "
-                  f"groups={num_groups}, hidden={hidden_dim}")
+                  f"groups={num_groups}, hidden={hidden_dim}, {mode_str}")
 
     return True
 
@@ -138,7 +156,7 @@ def check_gather_correctness(sol_mod, ref_mod, verbose=False):
     """Returns True if all gather tests pass."""
     ALIGNMENT = getattr(sol_mod, "ALIGNMENT", 128)
 
-    for bs, topk, num_experts, num_groups, hidden_dim in CORRECTNESS_CONFIGS:
+    for bs, topk, num_experts, num_groups, hidden_dim, group_size in CORRECTNESS_CONFIGS:
         start_expert = (num_experts - num_groups) // 2
         out_dim = hidden_dim
 
@@ -152,6 +170,7 @@ def check_gather_correctness(sol_mod, ref_mod, verbose=False):
 
         _, _, output_index, _ = sol_mod.moe_align_and_scatter(
             hidden_states, topk_ids, num_groups, start_expert, max_total_M,
+            group_size=group_size,
         )
         torch.manual_seed(123)
         gemm_output = torch.randn(max_total_M, out_dim, device="cuda", dtype=torch.bfloat16)
@@ -180,42 +199,58 @@ def check_gather_correctness(sol_mod, ref_mod, verbose=False):
 def check_roundtrip(sol_mod, verbose=False):
     """Scatter → identity GEMM (dequant) → gather roundtrip."""
     ALIGNMENT = getattr(sol_mod, "ALIGNMENT", 128)
-    bs, topk, num_experts, num_groups, hidden_dim = 1024, 8, 160, 20, 5120
-    start_expert = (num_experts - num_groups) // 2
 
-    torch.manual_seed(42)
-    hidden_states = torch.randn(bs, hidden_dim, device="cuda", dtype=torch.bfloat16)
-    topk_ids = torch.randint(0, num_experts, (bs, topk), device="cuda", dtype=torch.int32)
-    topk_weights = torch.softmax(
-        torch.randn(bs, topk, device="cuda", dtype=torch.float32), dim=-1,
-    )
-    max_total_M = bs * topk + num_groups * (ALIGNMENT - 1)
+    roundtrip_configs = [
+        # (bs, topk, num_experts, num_groups, hidden_dim, group_size)
+        (1024, 8, 160, 20, 5120, None),
+        (1024, 8, 160, 20, 5120, 128),
+    ]
 
-    sorted_hidden, _, output_index, sorted_scales = sol_mod.moe_align_and_scatter(
-        hidden_states, topk_ids, num_groups, start_expert, max_total_M,
-    )
+    for bs, topk, num_experts, num_groups, hidden_dim, group_size in roundtrip_configs:
+        start_expert = (num_experts - num_groups) // 2
 
-    # Dequantize FP8 back to bf16 for gather (simulates identity GEMM)
-    gemm_output = (sorted_hidden.float() * sorted_scales.unsqueeze(1)).to(torch.bfloat16)
-    out_tri = sol_mod.moe_gather(gemm_output, topk_weights, output_index)
+        torch.manual_seed(42)
+        hidden_states = torch.randn(bs, hidden_dim, device="cuda", dtype=torch.bfloat16)
+        topk_ids = torch.randint(0, num_experts, (bs, topk), device="cuda", dtype=torch.int32)
+        topk_weights = torch.softmax(
+            torch.randn(bs, topk, device="cuda", dtype=torch.float32), dim=-1,
+        )
+        max_total_M = bs * topk + num_groups * (ALIGNMENT - 1)
 
-    out_ref = torch.zeros_like(out_tri)
-    for i in range(bs):
-        for k in range(topk):
-            eid = topk_ids[i, k].item()
-            lid = eid - start_expert
-            if 0 <= lid < num_groups:
-                out_ref[i] += topk_weights[i, k].item() * hidden_states[i].float()
+        sorted_hidden, _, output_index, sorted_scales = sol_mod.moe_align_and_scatter(
+            hidden_states, topk_ids, num_groups, start_expert, max_total_M,
+            group_size=group_size,
+        )
 
-    rel_err = (out_tri.float() - out_ref.float()).abs().max().item() / (
-        out_ref.float().abs().max().item() + 1e-8
-    )
-    # FP8 roundtrip adds quantization error, so tolerance is higher
-    ok = rel_err < 0.1
-    if verbose:
-        status = "OK" if ok else "FAIL"
-        print(f"  roundtrip {status}  rel_err={rel_err:.2e}")
-    return ok
+        # Dequantize FP8 back to bf16 for gather (simulates identity GEMM)
+        if sorted_scales.dim() == 2:
+            scales_expanded = sorted_scales.repeat_interleave(group_size, dim=1)
+            gemm_output = (sorted_hidden.float() * scales_expanded).to(torch.bfloat16)
+        else:
+            gemm_output = (sorted_hidden.float() * sorted_scales.unsqueeze(1)).to(torch.bfloat16)
+        out_tri = sol_mod.moe_gather(gemm_output, topk_weights, output_index)
+
+        out_ref = torch.zeros_like(out_tri)
+        for i in range(bs):
+            for k in range(topk):
+                eid = topk_ids[i, k].item()
+                lid = eid - start_expert
+                if 0 <= lid < num_groups:
+                    out_ref[i] += topk_weights[i, k].item() * hidden_states[i].float()
+
+        rel_err = (out_tri.float() - out_ref.float()).abs().max().item() / (
+            out_ref.float().abs().max().item() + 1e-8
+        )
+        # FP8 roundtrip adds quantization error, so tolerance is higher
+        ok = rel_err < 0.1
+        mode_str = f"group={group_size}" if group_size else "per-token"
+        if verbose:
+            status = "OK" if ok else "FAIL"
+            print(f"  roundtrip {status}  {mode_str}  rel_err={rel_err:.2e}")
+        if not ok:
+            return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +258,7 @@ def check_roundtrip(sol_mod, verbose=False):
 # ---------------------------------------------------------------------------
 
 def bench_scatter_kernel_only(sol_mod, bs, topk, local_experts, hidden_size, start_expert):
-    """Pre-allocated buffers, measure only the Triton kernels (FP8 output)."""
+    """Pre-allocated buffers, measure only the Triton kernels (FP8 per-token output)."""
     ALIGNMENT = getattr(sol_mod, "ALIGNMENT", 128)
     FP8_MAX = getattr(sol_mod, "FP8_E4M3_MAX", 448.0)
     hidden_states = torch.randn(bs, hidden_size, device="cuda", dtype=torch.bfloat16)

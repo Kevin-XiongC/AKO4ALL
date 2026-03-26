@@ -18,19 +18,29 @@ def ref_moe_align_and_scatter(
     start_expert: int,
     max_total_M: int | None = None,
     alignment: int = ALIGNMENT,
+    group_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Reference scatter with fused FP8 per-token quantization.
+    Reference scatter with fused FP8 quantization.
+
+    Args:
+        group_size: If None, per-token quantization (one scale per row).
+                    If specified, per-group quantization (one scale per group_size elements).
 
     Returns:
         sorted_hidden: [max_total_M, hidden_dim]  FP8 e4m3fn quantized activations
         packed_layout: [2 * num_groups]  — [m_offsets | m_counts]
         output_index:  [bs * topk]       — reverse mapping (-1 for non-local)
-        sorted_scales: [max_total_M]     — per-row FP8 scale (float32)
+        sorted_scales: per-token: [max_total_M]  |  per-group: [max_total_M, hidden_dim // group_size]
     """
     bs, hidden_dim = hidden_states.shape
     topk = topk_ids.shape[1]
     device = hidden_states.device
+
+    use_per_group = group_size is not None and group_size < hidden_dim
+    if use_per_group:
+        assert hidden_dim % group_size == 0
+        num_scale_cols = hidden_dim // group_size
 
     flat_ids = topk_ids.reshape(-1)
 
@@ -51,7 +61,10 @@ def ref_moe_align_and_scatter(
     sorted_hidden = torch.zeros(
         max_total_M, hidden_dim, device=device, dtype=torch.float8_e4m3fn,
     )
-    sorted_scales = torch.zeros(max_total_M, device=device, dtype=torch.float32)
+    if use_per_group:
+        sorted_scales = torch.zeros(max_total_M, num_scale_cols, device=device, dtype=torch.float32)
+    else:
+        sorted_scales = torch.zeros(max_total_M, device=device, dtype=torch.float32)
     output_index = torch.full((bs * topk,), -1, dtype=torch.int32, device=device)
 
     write_pos = torch.zeros(num_groups, dtype=torch.int32, device=device)
@@ -64,17 +77,28 @@ def ref_moe_align_and_scatter(
             pos = write_pos[local_id].item()
             dst_row = offset + pos
 
-            # Per-token FP8 quantization
             row_f32 = hidden_states[token_idx].float()
-            max_val = row_f32.abs().max().item()
-            scale = max_val / FP8_E4M3_MAX
-            if scale > 0:
-                scale_inv = 1.0 / scale
+
+            if use_per_group:
+                # Per-group FP8 quantization
+                row_groups = row_f32.view(num_scale_cols, group_size)
+                group_max = row_groups.abs().amax(dim=1)  # [num_scale_cols]
+                scales = group_max / FP8_E4M3_MAX
+                scale_invs = torch.where(scales > 0, 1.0 / scales, torch.zeros_like(scales))
+                quantized = (row_groups * scale_invs.unsqueeze(1)).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+                sorted_hidden[dst_row] = quantized.view(hidden_dim).to(torch.float8_e4m3fn)
+                sorted_scales[dst_row] = scales
             else:
-                scale_inv = 0.0
-            quantized = (row_f32 * scale_inv).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-            sorted_hidden[dst_row] = quantized.to(torch.float8_e4m3fn)
-            sorted_scales[dst_row] = scale
+                # Per-token FP8 quantization
+                max_val = row_f32.abs().max().item()
+                scale = max_val / FP8_E4M3_MAX
+                if scale > 0:
+                    scale_inv = 1.0 / scale
+                else:
+                    scale_inv = 0.0
+                quantized = (row_f32 * scale_inv).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+                sorted_hidden[dst_row] = quantized.to(torch.float8_e4m3fn)
+                sorted_scales[dst_row] = scale
 
             output_index[idx] = dst_row
             write_pos[local_id] += 1
