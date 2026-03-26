@@ -22,3 +22,4 @@
 | 15 | Count autotune 16 vs 32 warps | — | — | 0.0314 avg | multi-config overhead, kept single 16 |
 | 16 | Speculative hidden_states load before pre-check | 0.0200 | 0.0116 | 0.0317 avg | wasted reads offset latency hiding, reverted |
 | 17 | Scatter without eviction policies | — | — | 0.0321 avg | eviction policies confirmed helpful, reverted |
+| 18 | Gather evict_first for gemm_output reads | — | — | 0.0332 avg | much worse, cross-tile sharing hurt, reverted |
