@@ -6,3 +6,4 @@
 |------|-------|-------------|------------|-----------|--------|
 | 0 | FP8 baseline (scatter+quant fused) | 0.0241 | 0.0120 | 0.0361 | baseline |
 | 1 | bf16 max / fewer intermediates / range(topk) | 0.0240 | 0.0113 | 0.0353 | marginal |
+| 2 | No pre-check for FP8 scatter | 0.0253 | 0.0113 | 0.0366 | worse — pre-check still essential |
