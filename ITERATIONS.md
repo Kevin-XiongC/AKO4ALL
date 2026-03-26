@@ -8,3 +8,4 @@
 | 1 | Eviction policies (evict_first writes, evict_last reads) | 0.0230 | 0.0115 | 0.0346 | improved -2.5% |
 | 2 | Autotune scatter num_warps | — | — | — | CUDA error, reverted |
 | 3 | Gather grid (5, 1024) — more token parallelism | 0.0227 | 0.0113 | 0.0340 | improved -1.7% |
+| 4 | 2-tile scatter (reduce reg pressure) | 0.0251 | 0.0114 | 0.0365 | worse — double load overhead, reverted |
