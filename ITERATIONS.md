@@ -11,23 +11,19 @@
 | 5 | Split read/write phases + inline fused_op | 0.99x | 0.1339 | regression |
 | 6 | Merge write+clear + read from allreduce_in | 0.97x | 0.1363 | regression |
 | 7 | Move oneshot clear after poll+fused_op | 1.01x | 0.1312 | no-change |
+| 8 | Lower oneshot threshold for 8 GPUs | **1.23x** | **0.1078** | **improved** |
 
-## Key Learnings After 6 Iterations
+## Key Improvement: Iter 8
 
-This kernel is extremely well-optimized by the TRT-LLM team. The main bottlenecks are:
+The Python-side oneshot/twoshot threshold for 8 GPUs was 42MB (≈268 tokens), making token 64-256 use the expensive Lamport oneshot protocol. Lowered to 5MB (≈32 tokens), switching medium tokens to the more efficient twoshot. Results:
 
-1. **NVLink bandwidth** for twoshot large tokens (cannot exceed hardware limit)
-2. **NVLink latency + Lamport polling overhead** for oneshot small tokens
-3. **Phase serialization** (copy → barrier → reduce → barrier → fused_op) is inherent to the algorithm
-4. **RMS norm's __syncthreads** prevents fusing computation into communication-heavy loops
+- Token 128: 0.107ms → 0.045ms (**2.4x faster**)
+- Token 256: 0.186ms → 0.054ms (**3.4x faster**)
+- Token 64: 0.055ms → 0.048ms (13% faster)
+- Large tokens (512+): unchanged
 
-What works: native bf16 __hadd2 packed operations (reduces instruction count for compute-bound oneshot).
-What doesn't: restructuring NVLink access patterns, forcing occupancy, or merging/splitting phases.
+The 8-rank Lamport polling is fundamentally inefficient: each rank writes to 8 buffers then polls 8 remote entries per element with volatile loads. The twoshot's structured scatter-reduce-allgather with barriers is much more efficient for these message sizes.
 
-The kernel achieves ~236 GB/s bus BW on 8xH200 for large tokens, vs theoretical ~450 GB/s per direction. The 2x gap is from the allreduce requiring both reads AND writes (each direction sees ~236/2 = 118 GB/s effective, with the other direction used for the complementary operation).
-
-## Iteration Details
-
-### Iter 1-6 (see git history for details)
-All iterations except iter 2 regressed or were neutral. Only iter 2 (native bf16 __hadd2) improved by 1.5%.
+## Iterations 1-7 (see git history)
+Only iter 2 (native bf16 __hadd2) improved (1.5%). All NVLink restructuring attempts (iters 1,3,4,5,6,7) regressed or were neutral, confirming the twoshot algorithm is well-optimized.
 
