@@ -32,6 +32,7 @@
 | 25 | BLOCK_D=512/256 gather | - | 0.0168/0.0188 | - | BLOCK_D=1024 still best |
 | 26 | output_index evict policies | 0.0279 | 0.0167 | 0.0447 | stable |
 | 27 | packed_layout evict_last store | 0.0281 | 0.0166 | 0.0446 | stable best |
+| 28 | gather output evict policies | - | 0.0229/0.0169 | - | evict_last hurts, evict_first neutral |
 
 ## Iterations
 
