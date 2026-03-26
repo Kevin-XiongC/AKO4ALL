@@ -23,3 +23,19 @@
 | 16 | Speculative hidden_states load before pre-check | 0.0200 | 0.0116 | 0.0317 avg | wasted reads offset latency hiding, reverted |
 | 17 | Scatter without eviction policies | — | — | 0.0321 avg | eviction policies confirmed helpful, reverted |
 | 18 | Gather evict_first for gemm_output reads | — | — | 0.0332 avg | much worse, cross-tile sharing hurt, reverted |
+
+## Final State
+
+**Best: Scatter 0.0194ms, Gather 0.0114ms, Total 0.0308ms** (from baseline 0.0355ms, **-13.2%**)
+
+### Optimizations Applied:
+1. **Eviction policies on scatter** — `evict_first` for FP8/scale writes, `evict_last` for hidden_states reads
+2. **Gather grid (5, 1024)** — increased token parallelism from (5, 512)
+3. **Single-pass count kernel** — replaced 8-iteration loop with single `tl.arange(0, 8192)` for bs≤2048 (TOTAL≤16384)
+4. **Count kernel num_warps=16** — more threads for single-pass histogram
+5. **Gather num_stages=2** — software pipeline for token processing
+
+### Fundamental Limits:
+- Scatter kernel: random writes to 20 expert regions across ~52MB buffer → L2 thrashing (550 GB/s = 11% of peak)
+- Gather kernel: random reads from scattered gemm_output positions → 1.2 TB/s = 25% of peak
+- Pre-sorting tokens by expert would convert random to sequential I/O but requires cross-kernel coordination not possible within bench constraints
