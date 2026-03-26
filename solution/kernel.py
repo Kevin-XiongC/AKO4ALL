@@ -229,6 +229,7 @@ def _scatter_tokens_kernel(
                 hidden_states_ptr + token_idx * stride_hs_m + h_offs,
                 mask=h_mask,
                 other=0.0,
+                eviction_policy="evict_last",
             )
 
             in_f32 = in_data.to(tl.float32)
@@ -268,15 +269,18 @@ def _scatter_tokens_kernel(
                         sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
                         fp8_data,
                         mask=h_mask,
+                        eviction_policy="evict_first",
                     )
                     if GROUP_SIZE > 0:
                         tl.store(
                             sorted_scales_ptr + dst_row * STRIDE_SC_M + g_offs,
                             scales,
                             mask=g_mask,
+                            eviction_policy="evict_first",
                         )
                     else:
-                        tl.store(sorted_scales_ptr + dst_row, scale)
+                        tl.store(sorted_scales_ptr + dst_row, scale,
+                                 eviction_policy="evict_first")
                 else:
                     tl.store(output_index_ptr + topk_base + k, -1)
         else:
