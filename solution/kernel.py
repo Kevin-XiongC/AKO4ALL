@@ -253,6 +253,7 @@ def _gather_triton(gemm_output, topk_weights, output_index):
         gemm_output.stride(0), output.stride(0),
         BLOCK_D=BLOCK_D,
         num_warps=num_warps,
+        num_stages=1,
     )
 
     return output

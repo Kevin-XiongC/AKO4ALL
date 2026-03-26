@@ -35,6 +35,7 @@
 | 28 | gather output evict policies | - | 0.0229/0.0169 | - | evict_last hurts, evict_first neutral |
 | 29 | torch.compile gather | 0.0290 | 0.2640 | 0.2931 | terrible |
 | 30 | scatter read evict_first | 0.0356 | 0.0169 | 0.0525 | regression — evict_last essential |
+| 31 | gather num_stages=1 | 0.0272 | 0.0170 | 0.0442 | marginal improvement |
 
 ## Iterations
 
