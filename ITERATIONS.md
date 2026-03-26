@@ -19,3 +19,4 @@
 | 12 | Autotune count kernel num_warps=8 | 0.0197 | 0.0115 | 0.0312 | improved -1.3% |
 | 13 | Autotune scatter single config | — | — | — | num_warps conflict with bench, reverted |
 | 14 | Count num_warps=16, gather num_stages=3 | 0.0206 | 0.0114 | 0.0321 | combined worse; count=16 alone ~0.0310 avg — kept num_warps=16 |
+| 15 | Count autotune 16 vs 32 warps | — | — | 0.0314 avg | multi-config overhead, kept single 16 |
