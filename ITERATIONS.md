@@ -29,6 +29,7 @@
 | 22 | evict_last on metadata reads | 0.0289 | 0.0168 | 0.0457 | improved |
 | 23 | count kernel evict_last topk_ids | 0.0276 | 0.0168 | 0.0445 | improved |
 | 24 | scatter topk_ids evict_last | 0.0281 | 0.0166 | 0.0447 | neutral |
+| 25 | BLOCK_D=512/256 gather | - | 0.0168/0.0188 | - | BLOCK_D=1024 still best |
 
 ## Iterations
 
