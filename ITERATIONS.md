@@ -1,4 +1,6 @@
-# Iteration Log
+# Iteration Log — trtllm_allreduce_fusion (kARResidualRMSNorm, 8xH200)
+
+## Final Result: 1.29x speedup (geomean 0.1322 → 0.1024 ms)
 
 ## Summary
 
@@ -12,32 +14,30 @@
 | 6 | Merge write+clear + read from allreduce_in | 0.97x | 0.1363 | regression |
 | 7 | Move oneshot clear after poll+fused_op | 1.01x | 0.1312 | no-change |
 | 8 | Lower oneshot threshold for 8 GPUs | **1.23x** | **0.1078** | **improved** |
-| 9 | Fine-tune threshold (3MB, 10MB) | — | — | threshold=5MB confirmed optimal |
+| 9 | Fine-tune threshold (3MB, 10MB) | — | — | threshold=5MB optimal |
 | 10 | Increase grid for small twoshot | **1.29x** | **0.1029** | **improved** |
 
-## Key Improvement: Iter 8
+## Three Successful Optimizations
 
-The Python-side oneshot/twoshot threshold for 8 GPUs was 42MB (≈268 tokens), making token 64-256 use the expensive Lamport oneshot protocol. Lowered to 5MB (≈32 tokens), switching medium tokens to the more efficient twoshot. Results:
+### 1. Native bf16 packed add (Iter 2) — 1.5% improvement
+Replaced float-conversion vec_add with `__hadd2` packed bf16 operations in both `allreduce_sum` and residual add paths. Reduces instruction count by ~60% for these operations. Main impact on small oneshot tokens where compute is a larger fraction.
 
-- Token 128: 0.107ms → 0.045ms (**2.4x faster**)
-- Token 256: 0.186ms → 0.054ms (**3.4x faster**)
-- Token 64: 0.055ms → 0.048ms (13% faster)
-- Large tokens (512+): unchanged
+### 2. Oneshot threshold tuning (Iter 8) — 23% improvement (the big win)
+The Python-side oneshot heuristic for 8 GPUs used 42MB threshold (≈268 tokens). The Lamport protocol with 8-rank polling is fundamentally expensive: each element requires 8 NVLink writes + 8 volatile reads per poll attempt. Lowered to 5MB (≈32 tokens), switching medium tokens to twoshot which uses structured scatter-reduce-allgather with explicit barriers.
+- Token 128: 0.107ms → 0.045ms (2.4x faster)
+- Token 256: 0.186ms → 0.054ms (3.4x faster)
 
-The 8-rank Lamport polling is fundamentally inefficient: each rank writes to 8 buffers then polls 8 remote entries per element with volatile loads. The twoshot's structured scatter-reduce-allgather with barriers is much more efficient for these message sizes.
+### 3. Grid utilization for small twoshot (Iter 10) — 5% improvement
+With the lower threshold, tokens 64-256 use twoshot but with small grids (8-32 blocks vs 132 SMs). Changed grid_size to use `max(token_per_rank, token_num)`, giving full SM utilization for phases 1 (copy) and 3 (fused_op). Extra blocks skip phase 2 but participate in barriers.
+- Token 64: 0.048ms → 0.035ms (25% faster)
+- Token 128: 0.045ms → 0.040ms (12% faster)
 
-### Iter 10 — Increase grid for small twoshot tokens
+## Key Learnings
 
-With iter 8's lower threshold, tokens 64-256 now use twoshot but with very small grids (8-32 blocks). Changed grid_size to use `max(token_per_rank, token_num)` for twoshot when grid would otherwise be underutilized. Extra blocks skip phase 2 but accelerate phases 1 and 3.
-
-- Token 64: 0.048ms → 0.036ms (25% faster, 8→64 blocks)
-- Token 128: 0.045ms → 0.039ms (12% faster, 16→128 blocks)
-- Geomean: 0.1078ms → 0.1029ms (**4.5% improvement** on top of iter 8)
-
-### Iter 9 — Fine-tune threshold
-
-Tested threshold=3MB (token 32 twoshot → terrible, 9.1 GB/s, only 4 blocks) and threshold=10MB (token 64 oneshot → 13% worse than twoshot). **Threshold=5MB is optimal** for our token range: tokens 16-32 oneshot, 64+ twoshot.
-
-## Iterations 1-7 (see git history)
-Only iter 2 (native bf16 __hadd2) improved (1.5%). All NVLink restructuring attempts (iters 1,3,4,5,6,7) regressed or were neutral, confirming the twoshot algorithm is well-optimized.
+1. **NVLink asymmetry**: Remote writes are fire-and-forget (pipelined), remote reads stall threads. "Write to all, read local" is optimal.
+2. **NVLink full-duplex**: Already utilized in the interleaved read+write pattern. Separating phases doesn't help.
+3. **Register pressure**: 64-72 regs/thread, only 1 block/SM possible. Reducing registers causes spilling that's worse than low occupancy.
+4. **RMS norm __syncthreads**: Prevents fusing fused_op into NVLink-heavy loops.
+5. **Compiler sensitivity**: Even "branch-free" approaches (pointer swizzling) can regress if they change the compiler's optimization decisions.
+6. **Heuristic tuning** was the biggest win — algorithmic parameters matter more than micro-optimizations for this kernel.
 
