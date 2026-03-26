@@ -6,6 +6,7 @@
 |------|-------|-------------|------------|-----------|--------|
 | 0 | Baseline | 0.0643 | 0.0347 | 0.0990 | baseline |
 | 1 | tl.histogram in count kernel | 0.0408 | 0.0346 | 0.0754 | improved |
+| 2 | gather num_warps=4 | 0.0398 | 0.0338 | 0.0736 | improved |
 
 ## Iterations
 

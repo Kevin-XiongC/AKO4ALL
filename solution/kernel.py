@@ -266,6 +266,7 @@ def moe_gather(
     BLOCK_D = 128 if out_dim % 1024 != 0 else 1024
     assert out_dim % BLOCK_D == 0, f"out_dim={out_dim} must be divisible by BLOCK_D={BLOCK_D}"
 
+    num_warps = 4 if BLOCK_D >= 512 else 2
     grid = (out_dim // BLOCK_D, min(bs, 1024))
     _gather_tokens_kernel[grid](
         gemm_output, flat_weights, flat_index,
@@ -273,7 +274,7 @@ def moe_gather(
         bs, topk,
         gemm_output.stride(0), output.stride(0),
         BLOCK_D=BLOCK_D,
-        num_warps=2,
+        num_warps=num_warps,
     )
 
     return output
