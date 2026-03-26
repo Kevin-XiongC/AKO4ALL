@@ -3,9 +3,10 @@ Triton kernels for MoE token scatter/gather with DeepGEMM m-offset layout.
 
 Optimizations applied (H200):
   - tl.histogram replaces O(BLOCK_SIZE * BLOCK_G) inner loop in count kernel
+  - Larger BLOCK_SIZE (4096) for count kernel to reduce iterations
   - 2-pass scatter: lightweight position allocation + 2D data copy kernel
   - 2D scatter grid (hidden_chunks x tokens) for 5x more parallelism on H200
-  - L2 cache eviction policies: evict_last on reads, evict_first on writes
+  - L2 cache eviction policies
   - torch.empty instead of torch.zeros for output buffers
   - BLOCK_D=1024 / num_warps=8 / num_stages=1 for gather kernel
 """
@@ -119,7 +120,7 @@ def _scatter_data_kernel(
         token_idx = token_idx_i32.to(tl.int64)
         topk_base = token_idx_i32 * topk
 
-        # Check if any local expert before loading data
+        # Check if any local expert
         any_local: tl.int1 = False
         for kk in tl.static_range(topk):
             idx = tl.load(output_index_ptr + topk_base + kk)
@@ -292,7 +293,8 @@ def moe_align_and_scatter(
     flat_topk_ids = topk_ids.view(-1)
 
     packed_layout = torch.empty(2 * num_groups, dtype=torch.int32, device=device)
-    BLOCK_SIZE = 1024
+    # Use larger BLOCK_SIZE to reduce iterations in count kernel
+    BLOCK_SIZE = min(4096, triton.next_power_of_2(num_elements))
     BLOCK_G = triton.next_power_of_2(num_groups)
     NUM_ITERS = math.ceil(num_elements / BLOCK_SIZE)
     _count_and_compute_layout_kernel[(1,)](
@@ -300,6 +302,7 @@ def moe_align_and_scatter(
         num_elements, start_expert, num_groups,
         BLOCK_G=BLOCK_G, ALIGNMENT=alignment,
         BLOCK_SIZE=BLOCK_SIZE, NUM_ITERS=NUM_ITERS,
+        num_warps=8,
     )
 
     sorted_hidden = torch.empty(
@@ -318,7 +321,10 @@ def moe_align_and_scatter(
 
     # Pass 2: Data copy (2D grid: hidden_chunks x tokens)
     BLOCK_H = 1024
-    assert hidden_dim % BLOCK_H == 0, f"hidden_dim={hidden_dim} must be divisible by BLOCK_H={BLOCK_H}"
+    if hidden_dim % BLOCK_H != 0:
+        # Fallback for non-1024-aligned dims
+        BLOCK_H = 128
+    assert hidden_dim % BLOCK_H == 0
     num_h_blocks = hidden_dim // BLOCK_H
     data_grid = (num_h_blocks, min(bs, 1024))
     _scatter_data_kernel[data_grid](
