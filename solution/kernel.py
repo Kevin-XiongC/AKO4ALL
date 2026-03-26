@@ -33,16 +33,28 @@ def _count_and_compute_layout_kernel(
 ):
     g_offs = tl.arange(0, BLOCK_G)
     g_mask = g_offs < num_groups
-    counts = tl.zeros([BLOCK_G], dtype=tl.int32)
 
-    for start in range(NUM_ITERS):
-        offs = start * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = offs < num_elements
-        expert_ids = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
+    TOTAL: tl.constexpr = BLOCK_SIZE * NUM_ITERS
+    if TOTAL <= 16384:
+        # Single-pass: load all elements at once (avoids loop overhead)
+        all_offs = tl.arange(0, TOTAL)
+        mask = all_offs < num_elements
+        expert_ids = tl.load(topk_ids_ptr + all_offs, mask=mask, other=-1)
         local_ids = expert_ids - start_expert
         valid = mask & (local_ids >= 0) & (local_ids < num_groups)
         safe_ids = tl.where(valid, local_ids, 0)
-        counts += tl.histogram(safe_ids, BLOCK_G, mask=valid)
+        counts = tl.histogram(safe_ids, BLOCK_G, mask=valid)
+    else:
+        # Multi-pass for large batch sizes
+        counts = tl.zeros([BLOCK_G], dtype=tl.int32)
+        for start in range(NUM_ITERS):
+            offs = start * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offs < num_elements
+            expert_ids = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
+            local_ids = expert_ids - start_expert
+            valid = mask & (local_ids >= 0) & (local_ids < num_groups)
+            safe_ids = tl.where(valid, local_ids, 0)
+            counts += tl.histogram(safe_ids, BLOCK_G, mask=valid)
 
     aligned = ((counts + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT
     offsets = tl.cumsum(aligned, axis=0) - aligned
