@@ -2,7 +2,7 @@
 # Benchmark wrapper with trajectory tracking
 # Usage: bash scripts/bench.sh [label]
 set -eo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 LABEL="${1:-}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -17,9 +17,9 @@ set -e
 
 # --- Trajectory ---
 if [ -n "$LABEL" ]; then
-    TRAJ_DIR="trajectory/${TIMESTAMP}_${LABEL}"
+  TRAJ_DIR="trajectory/${TIMESTAMP}_${LABEL}"
 else
-    TRAJ_DIR="trajectory/${TIMESTAMP}"
+  TRAJ_DIR="trajectory/${TIMESTAMP}"
 fi
 mkdir -p "$TRAJ_DIR"
 cp -r solution/* "$TRAJ_DIR/"
