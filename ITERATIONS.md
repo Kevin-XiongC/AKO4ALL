@@ -10,3 +10,4 @@
 | 3 | BLOCK_SIZE=8192 count + num_warps=8 data copy | 0.0226 | 0.0136 | 0.0362 | no change (bench uses hardcoded params for scatter_kern) |
 | 4 | Gather grid tokens=512 (2 tokens/block) | 0.0226 | 0.0128 | 0.0354 | improved gather |
 | 5 | Gather num_warps=4 | 0.0239 | 0.0115 | 0.0354 | **major gather improvement** |
+| 6 | Remove scatter/count eviction policies + static_range topk | 0.0237 | 0.0113 | 0.0351 | improved both |

@@ -42,8 +42,7 @@ def _count_and_compute_layout_kernel(
     for start in range(NUM_ITERS):
         offs = start * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offs < num_elements
-        expert_ids = tl.load(topk_ids_ptr + offs, mask=mask, other=-1,
-                             eviction_policy="evict_last")
+        expert_ids = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
         local_ids = expert_ids - start_expert
         valid = mask & (local_ids >= 0) & (local_ids < num_groups)
         safe_ids = tl.where(valid, local_ids, 0)
@@ -52,10 +51,8 @@ def _count_and_compute_layout_kernel(
     aligned = ((counts + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT
     offsets = tl.cumsum(aligned, axis=0) - aligned
 
-    tl.store(packed_layout_ptr + g_offs, offsets, mask=g_mask,
-             eviction_policy="evict_last")
-    tl.store(packed_layout_ptr + num_groups + g_offs, counts, mask=g_mask,
-             eviction_policy="evict_last")
+    tl.store(packed_layout_ptr + g_offs, offsets, mask=g_mask)
+    tl.store(packed_layout_ptr + num_groups + g_offs, counts, mask=g_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -185,35 +182,29 @@ def _scatter_tokens_kernel(
             in_data = tl.load(
                 hidden_states_ptr + token_idx * stride_hs_m + h_offs,
                 mask=h_mask,
-                eviction_policy="evict_last",
             )
 
-            for k in range(topk):
+            for k in tl.static_range(topk):
                 expert_id = tl.load(topk_ids_ptr + topk_base + k)
                 local_id = expert_id - start_expert
 
                 if local_id >= 0 and local_id < num_groups:
                     pos = tl.atomic_add(write_counters_ptr + local_id, 1)
-                    m_offset = tl.load(packed_layout_ptr + local_id,
-                                       eviction_policy="evict_last")
+                    m_offset = tl.load(packed_layout_ptr + local_id)
                     dst_row = (m_offset + pos).to(tl.int64)
 
                     tl.store(output_index_ptr + topk_base + k,
-                             (m_offset + pos),
-                             eviction_policy="evict_last")
+                             (m_offset + pos))
                     tl.store(
                         sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
                         in_data,
                         mask=h_mask,
-                        eviction_policy="evict_first",
                     )
                 else:
-                    tl.store(output_index_ptr + topk_base + k, -1,
-                             eviction_policy="evict_first")
+                    tl.store(output_index_ptr + topk_base + k, -1)
         else:
             for k in tl.static_range(topk):
-                tl.store(output_index_ptr + topk_base + k, -1,
-                         eviction_policy="evict_first")
+                tl.store(output_index_ptr + topk_base + k, -1)
 
 
 # ---------------------------------------------------------------------------
