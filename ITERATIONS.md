@@ -6,6 +6,7 @@
 |------|-------|---------|---------------------|--------|
 | 1 | Reduce twoshot NVLink writes | 0.91x | 0.1449 | regression |
 | 2 | Native bf16 vec_add + allreduce_sum | 1.02x | 0.1302 | improved |
+| 3 | Sequential poll-and-accumulate | 0.97x | 0.1365 | regression |
 
 ## Iterations
 
@@ -32,4 +33,16 @@
   - Speedup: 1.02x (improved)
 - **Analysis:** Main benefit for small oneshot tokens (token=16: 18% faster) where compute fraction is higher. Large twoshot tokens are memory-bound, compute optimization has minimal impact.
 - **Next:** Focus on memory access patterns or launch config to improve memory-bound large token performance.
+
+### Iter 3 — Sequential poll-and-accumulate (register pressure reduction)
+
+- **Hypothesis:** vals[NRanks] uses 32 registers. Sequential poll-and-accumulate uses only 8 regs, enabling 2 blocks/SM.
+- **Changes:** Replaced parallel polling with sequential per-rank polling in oneshot. Sequential load-accumulate in twoshot phase 2.
+- **Bench:**
+  - Compiled: True
+  - Correct: True
+  - Runtime: 0.1365 ms (geomean)
+  - Speedup: 0.97x (regression)
+- **Analysis:** Sequential polling serializes rank detection — if one rank is slow, it blocks checking subsequent ranks. The parallel approach detects ALL available data in one pass. Compiler also generates worse code. Reverted.
+- **Next:** Try maxrregcount compiler flag or use __launch_bounds__ to force lower register count without changing algorithm.
 
