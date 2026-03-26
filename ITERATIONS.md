@@ -23,6 +23,7 @@
 | 16 | static_range topk | 0.0369 | 0.0306 | 0.0675 | noise |
 | 17 | static_range count loop | 0.0375 | 0.0309 | 0.0684 | worse at high bs |
 | 18 | gather grid tokens=512 | 0.0369 | 0.0376 | 0.0745 | regression |
+| 19 | gather evict_last on reads | 0.0370 | 0.0177 | 0.0547 | **major improvement** |
 
 ## Iterations
 

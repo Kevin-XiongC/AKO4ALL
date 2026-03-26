@@ -152,6 +152,7 @@ def _gather_tokens_kernel(
                     + src_row * stride_gemm_m
                     + block_idx * BLOCK_D
                     + d_offs,
+                    eviction_policy="evict_last",
                 )
                 acc += val.to(tl.float32) * weight
 
