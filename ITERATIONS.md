@@ -16,6 +16,7 @@
 | 9 | scatter eviction_policy=evict_first | 0.0364 | 0.0306 | 0.0670 | marginal |
 | 10 | CUDA graph/tiled scatter - reverted | 0.0372 | 0.0307 | 0.0679 | no change |
 | 11 | remove eviction policy + BLOCK_D=1024 | 0.0369 | 0.0302 | 0.0671 | best |
+| 12 | num_stages=3 gather | 0.0369 | 0.0307 | 0.0676 | no change |
 
 ## Iterations
 
