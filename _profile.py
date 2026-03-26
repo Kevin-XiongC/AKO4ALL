@@ -19,12 +19,12 @@ topk_weights = torch.softmax(torch.randn(bs, topk, device="cuda", dtype=torch.fl
 max_total_M = bs * topk + local_experts * (ALIGNMENT - 1)
 
 # warmup
-sorted_hidden, packed_layout, output_index = sol.moe_align_and_scatter(hidden_states, topk_ids, local_experts, start_expert, max_total_M)
+sorted_hidden, packed_layout, output_index, sorted_scales = sol.moe_align_and_scatter(hidden_states, topk_ids, local_experts, start_expert, max_total_M)
 gemm_output = torch.randn(max_total_M, hidden_size, device="cuda", dtype=torch.bfloat16)
 out = sol.moe_gather(gemm_output, topk_weights, output_index)
 torch.cuda.synchronize()
 
 # profiled run
-sorted_hidden, packed_layout, output_index = sol.moe_align_and_scatter(hidden_states, topk_ids, local_experts, start_expert, max_total_M)
+sorted_hidden, packed_layout, output_index, sorted_scales = sol.moe_align_and_scatter(hidden_states, topk_ids, local_experts, start_expert, max_total_M)
 out = sol.moe_gather(gemm_output, topk_weights, output_index)
 torch.cuda.synchronize()

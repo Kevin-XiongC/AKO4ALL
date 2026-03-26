@@ -200,10 +200,9 @@ def _scatter_tokens_kernel(
             max_val = tl.max(tl.where(h_mask, tl.abs(in_f32), 0.0))
             scale = max_val / FP8_MAX
             scale_inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
-            quantized = in_f32 * scale_inv
-            fp8_data = quantized.to(tl.float8e4nv)
+            fp8_data = (in_f32 * scale_inv).to(tl.float8e4nv)
 
-            for k in tl.static_range(topk):
+            for k in range(topk):
                 expert_id = tl.load(topk_ids_ptr + topk_base + k)
                 local_id = expert_id - start_expert
 
