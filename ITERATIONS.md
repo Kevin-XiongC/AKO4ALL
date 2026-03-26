@@ -26,6 +26,7 @@
 | 19 | gather evict_last on reads | 0.0370 | 0.0177 | 0.0547 | **major improvement** |
 | 20 | scatter evict_last on reads | 0.0288 | 0.0175 | 0.0463 | **major improvement** |
 | 21 | + scatter write evict_first | 0.0292 | 0.0174 | 0.0466 | stable best |
+| 22 | evict_last on metadata reads | 0.0289 | 0.0168 | 0.0457 | improved |
 
 ## Iterations
 

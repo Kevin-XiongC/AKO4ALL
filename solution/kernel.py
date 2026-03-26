@@ -97,7 +97,7 @@ def _scatter_tokens_kernel(
 
                 if local_id >= 0 and local_id < num_groups:
                     pos = tl.atomic_add(write_counters_ptr + local_id, 1)
-                    m_offset = tl.load(packed_layout_ptr + local_id)
+                    m_offset = tl.load(packed_layout_ptr + local_id, eviction_policy="evict_last")
                     dst_row = (m_offset + pos).to(tl.int64)
 
                     tl.store(output_index_ptr + topk_base + k, (m_offset + pos))
@@ -143,11 +143,11 @@ def _gather_tokens_kernel(
         acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
         for k in tl.static_range(topk):
-            src_row_i32 = tl.load(output_index_ptr + topk_base + k)
+            src_row_i32 = tl.load(output_index_ptr + topk_base + k, eviction_policy="evict_last")
 
             if src_row_i32 >= 0:
                 src_row = src_row_i32.to(tl.int64)
-                weight = tl.load(topk_weights_ptr + topk_base + k)
+                weight = tl.load(topk_weights_ptr + topk_base + k, eviction_policy="evict_last")
 
                 val = tl.load(
                     gemm_output_ptr
