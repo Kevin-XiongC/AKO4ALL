@@ -174,6 +174,7 @@ def _scatter_tokens_kernel(
         token_idx = token_idx_i32.to(tl.int64)
         topk_base = token_idx_i32 * topk
 
+        # Pre-check: does this token have any local experts?
         any_local: tl.int32 = 0
         for kk in tl.static_range(topk):
             eid = tl.load(topk_ids_ptr + topk_base + kk)
@@ -364,7 +365,7 @@ def moe_gather(
         num_warps = 2
     assert out_dim % BLOCK_D == 0
 
-    grid = (out_dim // BLOCK_D, min(bs, 1024))
+    grid = (out_dim // BLOCK_D, min(bs, 512))
     _gather_tokens_kernel[grid](
         gemm_output, flat_weights, flat_index,
         output,
