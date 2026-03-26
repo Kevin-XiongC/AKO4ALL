@@ -33,7 +33,7 @@ def _count_and_compute_layout_kernel(
     for start in range(NUM_ITERS):
         offs = start * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offs < num_elements
-        expert_ids = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
+        expert_ids = tl.load(topk_ids_ptr + offs, mask=mask, other=-1, eviction_policy="evict_last")
         local_ids = expert_ids - start_expert
         valid = mask & (local_ids >= 0) & (local_ids < num_groups)
         safe_ids = tl.where(valid, local_ids, 0)
