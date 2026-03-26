@@ -217,11 +217,8 @@ def moe_align_and_scatter(
     return sorted_hidden, packed_layout, output_index
 
 
-def moe_gather(
-    gemm_output: torch.Tensor,
-    topk_weights: torch.Tensor,
-    output_index: torch.Tensor,
-) -> torch.Tensor:
+def _gather_triton(gemm_output, topk_weights, output_index):
+    """Triton-based gather."""
     bs = topk_weights.shape[0]
     topk = topk_weights.shape[1]
     out_dim = gemm_output.shape[1]
@@ -256,3 +253,39 @@ def moe_gather(
     )
 
     return output
+
+
+def _gather_pytorch(gemm_output, topk_weights, output_index):
+    """PyTorch index_select + index_add gather."""
+    bs = topk_weights.shape[0]
+    topk = topk_weights.shape[1]
+    out_dim = gemm_output.shape[1]
+
+    flat_index = output_index.view(-1)
+    flat_weights = topk_weights.view(-1)
+
+    valid = flat_index >= 0
+    valid_idx = valid.nonzero(as_tuple=False).squeeze(-1)
+    valid_rows = flat_index[valid_idx].long()
+    valid_tokens = (valid_idx // topk).long()
+    valid_w = flat_weights[valid_idx]
+
+    gathered = gemm_output[valid_rows].float()
+    weighted = gathered * valid_w.unsqueeze(1)
+
+    output = torch.zeros(bs, out_dim, device=gemm_output.device, dtype=torch.float32)
+    output.index_add_(0, valid_tokens, weighted)
+    return output.to(gemm_output.dtype)
+
+
+def moe_gather(
+    gemm_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output_index: torch.Tensor,
+) -> torch.Tensor:
+    return _gather_triton(gemm_output, topk_weights, output_index)
+
+
+# Expose for backward compatibility
+def _gather_tokens_tiled_kernel(*args, **kwargs):
+    pass
