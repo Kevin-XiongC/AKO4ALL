@@ -12,3 +12,4 @@
 | 5 | Gather num_warps=4 | 0.0239 | 0.0115 | 0.0354 | **major gather improvement** |
 | 6 | Remove scatter/count eviction policies + static_range topk | 0.0237 | 0.0113 | 0.0351 | improved both |
 | 7 | Scatter evict_first on data writes / gather BLOCK_D=512 / stages=2 | varies | varies | 0.0357-0.0368 | all worse, reverted to iter 6 |
+| 8 | Full-row gather BLOCK_D=8192 + various | 0.0239 | 0.0119 | 0.0358 | worse gather — fewer blocks hurts |
