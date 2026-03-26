@@ -708,9 +708,28 @@ template <typename T, uint32_t VEC_SIZE>
 __device__ __forceinline__ vec_t<T, VEC_SIZE> vec_add(const vec_t<T, VEC_SIZE>& a,
                                                       const vec_t<T, VEC_SIZE>& b) {
   vec_t<T, VEC_SIZE> ret;
+  // Use native half-precision packed add (2 elements per instruction) for bf16/fp16
+  if constexpr (std::is_same_v<T, __nv_bfloat16> && VEC_SIZE >= 2) {
 #pragma unroll
-  for (int i = 0; i < VEC_SIZE; ++i) {
-    ret[i] = static_cast<float>(a[i]) + static_cast<float>(b[i]);
+    for (int i = 0; i < VEC_SIZE; i += 2) {
+      auto pa = *reinterpret_cast<const __nv_bfloat162*>(&a[i]);
+      auto pb = *reinterpret_cast<const __nv_bfloat162*>(&b[i]);
+      auto pr = __hadd2(pa, pb);
+      *reinterpret_cast<__nv_bfloat162*>(&ret[i]) = pr;
+    }
+  } else if constexpr (std::is_same_v<T, half> && VEC_SIZE >= 2) {
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; i += 2) {
+      auto pa = *reinterpret_cast<const half2*>(&a[i]);
+      auto pb = *reinterpret_cast<const half2*>(&b[i]);
+      auto pr = __hadd2(pa, pb);
+      *reinterpret_cast<half2*>(&ret[i]) = pr;
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      ret[i] = static_cast<float>(a[i]) + static_cast<float>(b[i]);
+    }
   }
   return ret;
 }
@@ -1147,12 +1166,39 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> allreduce_sum(vec_t<T, VEC_SIZE>* 
     }
     return acc;
   } else {
-    vec_t<T, VEC_SIZE> acc = vals[0];
+    // For bf16/fp16 non-fp32-acc: use packed native add to minimize instructions
+    if constexpr (std::is_same_v<T, __nv_bfloat16> && VEC_SIZE >= 2) {
+      vec_t<T, VEC_SIZE> acc = vals[0];
 #pragma unroll
-    for (int r = 1; r < NRanks; ++r) {
-      acc = vec_add<T, VEC_SIZE>(acc, vals[r]);
+      for (int r = 1; r < NRanks; ++r) {
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; i += 2) {
+          auto pa = *reinterpret_cast<__nv_bfloat162*>(&acc[i]);
+          auto pb = *reinterpret_cast<const __nv_bfloat162*>(&vals[r][i]);
+          *reinterpret_cast<__nv_bfloat162*>(&acc[i]) = __hadd2(pa, pb);
+        }
+      }
+      return acc;
+    } else if constexpr (std::is_same_v<T, half> && VEC_SIZE >= 2) {
+      vec_t<T, VEC_SIZE> acc = vals[0];
+#pragma unroll
+      for (int r = 1; r < NRanks; ++r) {
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; i += 2) {
+          auto pa = *reinterpret_cast<half2*>(&acc[i]);
+          auto pb = *reinterpret_cast<const half2*>(&vals[r][i]);
+          *reinterpret_cast<half2*>(&acc[i]) = __hadd2(pa, pb);
+        }
+      }
+      return acc;
+    } else {
+      vec_t<T, VEC_SIZE> acc = vals[0];
+#pragma unroll
+      for (int r = 1; r < NRanks; ++r) {
+        acc = vec_add<T, VEC_SIZE>(acc, vals[r]);
+      }
+      return acc;
     }
-    return acc;
   }
 }
 
