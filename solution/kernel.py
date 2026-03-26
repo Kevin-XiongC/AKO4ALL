@@ -88,6 +88,7 @@ def _scatter_tokens_kernel(
             in_data = tl.load(
                 hidden_states_ptr + token_idx * stride_hs_m + h_offs,
                 mask=h_mask,
+                eviction_policy="evict_last",
             )
 
             for k in range(topk):
