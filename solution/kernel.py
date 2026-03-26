@@ -51,10 +51,8 @@ def _count_and_compute_layout_kernel(
         expert_ids = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
         local_ids = expert_ids - start_expert
         valid = mask & (local_ids >= 0) & (local_ids < num_groups)
-
-        for g in tl.static_range(BLOCK_G):
-            count_g = tl.sum(((local_ids == g) & valid).to(tl.int32))
-            counts += tl.where(g_offs == g, count_g, 0)
+        safe_ids = tl.where(valid, local_ids, 0)
+        counts += tl.histogram(safe_ids, BLOCK_G, mask=valid)
 
     aligned = ((counts + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT
     offsets = tl.cumsum(aligned, axis=0) - aligned
