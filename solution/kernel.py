@@ -1,5 +1,12 @@
 """
 Triton kernels for MoE token scatter/gather with DeepGEMM m-offset layout.
+
+Optimizations applied:
+  - tl.histogram replaces O(BLOCK_SIZE * BLOCK_G) inner loop in count kernel
+  - Skip hidden row load for tokens with no local experts (~34% skip rate)
+  - L2 cache eviction policies: evict_last on reads (keep hot), evict_first on writes (don't pollute)
+  - torch.empty instead of torch.zeros for gather output
+  - BLOCK_D=1024 / num_warps=8 / num_stages=1 for gather kernel
 """
 
 import math
@@ -33,7 +40,8 @@ def _count_and_compute_layout_kernel(
     for start in range(NUM_ITERS):
         offs = start * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offs < num_elements
-        expert_ids = tl.load(topk_ids_ptr + offs, mask=mask, other=-1, eviction_policy="evict_last")
+        expert_ids = tl.load(topk_ids_ptr + offs, mask=mask, other=-1,
+                             eviction_policy="evict_last")
         local_ids = expert_ids - start_expert
         valid = mask & (local_ids >= 0) & (local_ids < num_groups)
         safe_ids = tl.where(valid, local_ids, 0)
@@ -42,8 +50,10 @@ def _count_and_compute_layout_kernel(
     aligned = ((counts + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT
     offsets = tl.cumsum(aligned, axis=0) - aligned
 
-    tl.store(packed_layout_ptr + g_offs, offsets, mask=g_mask, eviction_policy="evict_last")
-    tl.store(packed_layout_ptr + num_groups + g_offs, counts, mask=g_mask, eviction_policy="evict_last")
+    tl.store(packed_layout_ptr + g_offs, offsets, mask=g_mask,
+             eviction_policy="evict_last")
+    tl.store(packed_layout_ptr + num_groups + g_offs, counts, mask=g_mask,
+             eviction_policy="evict_last")
 
 
 # ---------------------------------------------------------------------------
@@ -97,10 +107,13 @@ def _scatter_tokens_kernel(
 
                 if local_id >= 0 and local_id < num_groups:
                     pos = tl.atomic_add(write_counters_ptr + local_id, 1)
-                    m_offset = tl.load(packed_layout_ptr + local_id, eviction_policy="evict_last")
+                    m_offset = tl.load(packed_layout_ptr + local_id,
+                                       eviction_policy="evict_last")
                     dst_row = (m_offset + pos).to(tl.int64)
 
-                    tl.store(output_index_ptr + topk_base + k, (m_offset + pos), eviction_policy="evict_last")
+                    tl.store(output_index_ptr + topk_base + k,
+                             (m_offset + pos),
+                             eviction_policy="evict_last")
                     tl.store(
                         sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
                         in_data,
@@ -108,10 +121,12 @@ def _scatter_tokens_kernel(
                         eviction_policy="evict_first",
                     )
                 else:
-                    tl.store(output_index_ptr + topk_base + k, -1, eviction_policy="evict_first")
+                    tl.store(output_index_ptr + topk_base + k, -1,
+                             eviction_policy="evict_first")
         else:
             for k in tl.static_range(topk):
-                tl.store(output_index_ptr + topk_base + k, -1, eviction_policy="evict_first")
+                tl.store(output_index_ptr + topk_base + k, -1,
+                         eviction_policy="evict_first")
 
 
 # ---------------------------------------------------------------------------
@@ -143,11 +158,13 @@ def _gather_tokens_kernel(
         acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
         for k in tl.static_range(topk):
-            src_row_i32 = tl.load(output_index_ptr + topk_base + k, eviction_policy="evict_last")
+            src_row_i32 = tl.load(output_index_ptr + topk_base + k,
+                                  eviction_policy="evict_last")
 
             if src_row_i32 >= 0:
                 src_row = src_row_i32.to(tl.int64)
-                weight = tl.load(topk_weights_ptr + topk_base + k, eviction_policy="evict_last")
+                weight = tl.load(topk_weights_ptr + topk_base + k,
+                                 eviction_policy="evict_last")
 
                 val = tl.load(
                     gemm_output_ptr
@@ -162,59 +179,6 @@ def _gather_tokens_kernel(
             output_ptr
             + token_idx * stride_out_m
             + block_idx * BLOCK_D
-            + d_offs,
-            acc.to(output_ptr.dtype.element_ty),
-        )
-
-
-@triton.jit
-def _gather_persistent_kernel(
-    gemm_output_ptr,
-    topk_weights_ptr,
-    output_index_ptr,
-    output_ptr,
-    num_tokens,
-    topk: tl.constexpr,
-    stride_gemm_m,
-    stride_out_m,
-    num_d_blocks,
-    BLOCK_D: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    total_tiles = num_d_blocks * num_tokens
-    d_offs = tl.arange(0, BLOCK_D)
-
-    for tile_id in range(pid, total_tiles, NUM_SMS):
-        block_idx = (tile_id % num_d_blocks)
-        token_idx_i32 = tile_id // num_d_blocks
-
-        block_idx_i64 = block_idx.to(tl.int64)
-        token_idx = token_idx_i32.to(tl.int64)
-        topk_base = token_idx_i32 * topk
-
-        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-
-        for k in tl.static_range(topk):
-            src_row_i32 = tl.load(output_index_ptr + topk_base + k, eviction_policy="evict_last")
-
-            if src_row_i32 >= 0:
-                src_row = src_row_i32.to(tl.int64)
-                weight = tl.load(topk_weights_ptr + topk_base + k, eviction_policy="evict_last")
-
-                val = tl.load(
-                    gemm_output_ptr
-                    + src_row * stride_gemm_m
-                    + block_idx_i64 * BLOCK_D
-                    + d_offs,
-                    eviction_policy="evict_last",
-                )
-                acc += val.to(tl.float32) * weight
-
-        tl.store(
-            output_ptr
-            + token_idx * stride_out_m
-            + block_idx_i64 * BLOCK_D
             + d_offs,
             acc.to(output_ptr.dtype.element_ty),
         )
@@ -273,8 +237,11 @@ def moe_align_and_scatter(
     return sorted_hidden, packed_layout, output_index
 
 
-def _gather_triton(gemm_output, topk_weights, output_index):
-    """Triton-based gather."""
+def moe_gather(
+    gemm_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output_index: torch.Tensor,
+) -> torch.Tensor:
     bs = topk_weights.shape[0]
     topk = topk_weights.shape[1]
     out_dim = gemm_output.shape[1]
@@ -310,34 +277,3 @@ def _gather_triton(gemm_output, topk_weights, output_index):
     )
 
     return output
-
-
-def _gather_pytorch(gemm_output, topk_weights, output_index):
-    """PyTorch index_select + index_add gather."""
-    bs = topk_weights.shape[0]
-    topk = topk_weights.shape[1]
-    out_dim = gemm_output.shape[1]
-
-    flat_index = output_index.view(-1)
-    flat_weights = topk_weights.view(-1)
-
-    valid = flat_index >= 0
-    valid_idx = valid.nonzero(as_tuple=False).squeeze(-1)
-    valid_rows = flat_index[valid_idx].long()
-    valid_tokens = (valid_idx // topk).long()
-    valid_w = flat_weights[valid_idx]
-
-    gathered = gemm_output[valid_rows].float()
-    weighted = gathered * valid_w.unsqueeze(1)
-
-    output = torch.zeros(bs, out_dim, device=gemm_output.device, dtype=torch.float32)
-    output.index_add_(0, valid_tokens, weighted)
-    return output.to(gemm_output.dtype)
-
-
-def moe_gather(
-    gemm_output: torch.Tensor,
-    topk_weights: torch.Tensor,
-    output_index: torch.Tensor,
-) -> torch.Tensor:
-    return _gather_triton(gemm_output, topk_weights, output_index)
