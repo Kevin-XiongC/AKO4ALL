@@ -10,3 +10,4 @@
 | 3 | Gather grid (5, 1024) — more token parallelism | 0.0227 | 0.0113 | 0.0340 | improved -1.7% |
 | 4 | 2-tile scatter (reduce reg pressure) | 0.0251 | 0.0114 | 0.0365 | worse — double load overhead, reverted |
 | 5 | Gather num_warps=8 | 0.0231 | 0.0136 | 0.0367 | worse — too few blocks/SM, reverted |
+| 6 | Gather num_stages=2 | 0.0228 | 0.0113 | 0.0340 | no change |

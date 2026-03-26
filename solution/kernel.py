@@ -485,7 +485,7 @@ def moe_gather(
         gemm_output.stride(0), output.stride(0),
         BLOCK_D=BLOCK_D,
         num_warps=num_warps,
-        num_stages=1,
+        num_stages=2,
     )
 
     return output
