@@ -10,6 +10,7 @@
 | 4 | __launch_bounds__(640,2) | 0.97x | 0.1360 | regression |
 | 5 | Split read/write phases + inline fused_op | 0.99x | 0.1339 | regression |
 | 6 | Merge write+clear + read from allreduce_in | 0.97x | 0.1363 | regression |
+| 7 | Move oneshot clear after poll+fused_op | 1.01x | 0.1312 | no-change |
 
 ## Key Learnings After 6 Iterations
 
