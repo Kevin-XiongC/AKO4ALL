@@ -14,6 +14,7 @@
 | 7 | skip data load for non-local tokens | 0.0370 | 0.0305 | 0.0675 | improved |
 | 8 | gather BLOCK_D=1024, num_warps=8 | 0.0372 | 0.0301 | 0.0673 | marginal |
 | 9 | scatter eviction_policy=evict_first | 0.0364 | 0.0306 | 0.0670 | marginal |
+| 10 | CUDA graph/tiled scatter - reverted | 0.0372 | 0.0307 | 0.0679 | no change |
 
 ## Iterations
 
