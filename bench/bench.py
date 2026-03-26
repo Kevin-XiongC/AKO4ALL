@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Custom benchmark evaluator for MoE scatter/gather kernels.
+Custom benchmark evaluator for MoE scatter/gather kernels with FP8 quantization.
 
 Tests correctness against the PyTorch reference, then measures GPU-side
 performance using triton.testing.do_bench (CUDA events).
@@ -39,6 +39,8 @@ TOPK = 8
 START_EXPERT = 0
 PRIMARY_BS = 1024
 
+FP8_E4M3_MAX = 448.0
+
 CORRECTNESS_CONFIGS = [
     # (bs, topk, num_experts, num_groups, hidden_dim)
     (128,  2,  64,  8, 4096),
@@ -70,7 +72,7 @@ def _sort_rows(rows, proj):
 # ---------------------------------------------------------------------------
 
 def check_scatter_correctness(sol_mod, ref_mod, verbose=False):
-    """Returns True if all scatter tests pass."""
+    """Returns True if all scatter tests pass (FP8 output)."""
     ALIGNMENT = getattr(sol_mod, "ALIGNMENT", 128)
 
     for bs, topk, num_experts, num_groups, hidden_dim in CORRECTNESS_CONFIGS:
@@ -80,33 +82,27 @@ def check_scatter_correctness(sol_mod, ref_mod, verbose=False):
         topk_ids = torch.randint(0, num_experts, (bs, topk), device="cuda", dtype=torch.int32)
         max_total_M = bs * topk + num_groups * (ALIGNMENT - 1)
 
-        s_tri, p_tri, i_tri = sol_mod.moe_align_and_scatter(
+        s_tri, p_tri, i_tri, sc_tri = sol_mod.moe_align_and_scatter(
             hidden_states, topk_ids, num_groups, start_expert, max_total_M,
         )
-        s_ref, p_ref, i_ref = ref_mod.ref_moe_align_and_scatter(
+        s_ref, p_ref, i_ref, sc_ref = ref_mod.ref_moe_align_and_scatter(
             hidden_states, topk_ids, num_groups, start_expert, max_total_M,
         )
 
+        # Check packed_layout
         if not torch.equal(p_tri, p_ref):
             if verbose:
                 print(f"  FAIL scatter packed_layout bs={bs}: "
                       f"got {p_tri.tolist()}, expected {p_ref.tolist()}")
             return False
 
-        gen = torch.Generator(device="cuda").manual_seed(12345)
-        proj = torch.randn(hidden_dim, device="cuda", dtype=torch.float32, generator=gen)
-        for g in range(num_groups):
-            offset = p_ref[g].item()
-            count = p_ref[num_groups + g].item()
-            if count == 0:
-                continue
-            tri_sorted = _sort_rows(s_tri[offset:offset + count], proj)
-            ref_sorted = _sort_rows(s_ref[offset:offset + count], proj)
-            if not torch.equal(tri_sorted, ref_sorted):
-                if verbose:
-                    print(f"  FAIL scatter group {g} data mismatch bs={bs}")
-                return False
+        # Check output dtype
+        if s_tri.dtype != torch.float8_e4m3fn:
+            if verbose:
+                print(f"  FAIL scatter dtype: expected float8_e4m3fn, got {s_tri.dtype}")
+            return False
 
+        # Check each output_index entry: dequant should be close to source
         flat_ids = topk_ids.reshape(-1)
         for i in range(bs * topk):
             eid = flat_ids[i].item()
@@ -118,9 +114,12 @@ def check_scatter_correctness(sol_mod, ref_mod, verbose=False):
                         print(f"  FAIL scatter output_index[{i}] should be >= 0")
                     return False
                 tok = i // topk
-                if not torch.equal(s_tri[row], hidden_states[tok]):
+                src = hidden_states[tok].float()
+                dst_dequant = s_tri[row].float() * sc_tri[row].item()
+                rel_err = (dst_dequant - src).abs().max().item() / (src.abs().max().item() + 1e-8)
+                if rel_err > 0.1:
                     if verbose:
-                        print(f"  FAIL scatter output_index[{i}] points to wrong data")
+                        print(f"  FAIL scatter output_index[{i}] dequant error {rel_err:.4f}")
                     return False
             else:
                 if row != -1:
@@ -151,7 +150,7 @@ def check_gather_correctness(sol_mod, ref_mod, verbose=False):
         )
         max_total_M = bs * topk + num_groups * (ALIGNMENT - 1)
 
-        _, _, output_index = sol_mod.moe_align_and_scatter(
+        _, _, output_index, _ = sol_mod.moe_align_and_scatter(
             hidden_states, topk_ids, num_groups, start_expert, max_total_M,
         )
         torch.manual_seed(123)
@@ -179,7 +178,7 @@ def check_gather_correctness(sol_mod, ref_mod, verbose=False):
 
 
 def check_roundtrip(sol_mod, verbose=False):
-    """Scatter → identity GEMM → gather roundtrip."""
+    """Scatter → identity GEMM (dequant) → gather roundtrip."""
     ALIGNMENT = getattr(sol_mod, "ALIGNMENT", 128)
     bs, topk, num_experts, num_groups, hidden_dim = 1024, 8, 160, 20, 5120
     start_expert = (num_experts - num_groups) // 2
@@ -192,10 +191,13 @@ def check_roundtrip(sol_mod, verbose=False):
     )
     max_total_M = bs * topk + num_groups * (ALIGNMENT - 1)
 
-    sorted_hidden, _, output_index = sol_mod.moe_align_and_scatter(
+    sorted_hidden, _, output_index, sorted_scales = sol_mod.moe_align_and_scatter(
         hidden_states, topk_ids, num_groups, start_expert, max_total_M,
     )
-    out_tri = sol_mod.moe_gather(sorted_hidden, topk_weights, output_index)
+
+    # Dequantize FP8 back to bf16 for gather (simulates identity GEMM)
+    gemm_output = (sorted_hidden.float() * sorted_scales.unsqueeze(1)).to(torch.bfloat16)
+    out_tri = sol_mod.moe_gather(gemm_output, topk_weights, output_index)
 
     out_ref = torch.zeros_like(out_tri)
     for i in range(bs):
@@ -208,7 +210,8 @@ def check_roundtrip(sol_mod, verbose=False):
     rel_err = (out_tri.float() - out_ref.float()).abs().max().item() / (
         out_ref.float().abs().max().item() + 1e-8
     )
-    ok = rel_err < 1e-2
+    # FP8 roundtrip adds quantization error, so tolerance is higher
+    ok = rel_err < 0.1
     if verbose:
         status = "OK" if ok else "FAIL"
         print(f"  roundtrip {status}  rel_err={rel_err:.2e}")
@@ -220,8 +223,9 @@ def check_roundtrip(sol_mod, verbose=False):
 # ---------------------------------------------------------------------------
 
 def bench_scatter_kernel_only(sol_mod, bs, topk, local_experts, hidden_size, start_expert):
-    """Pre-allocated buffers, measure only the Triton kernels."""
+    """Pre-allocated buffers, measure only the Triton kernels (FP8 output)."""
     ALIGNMENT = getattr(sol_mod, "ALIGNMENT", 128)
+    FP8_MAX = getattr(sol_mod, "FP8_E4M3_MAX", 448.0)
     hidden_states = torch.randn(bs, hidden_size, device="cuda", dtype=torch.bfloat16)
     topk_ids = torch.randint(0, NUM_EXPERTS, (bs, topk), device="cuda", dtype=torch.int32)
     max_total_M = bs * topk + local_experts * (ALIGNMENT - 1)
@@ -229,7 +233,8 @@ def bench_scatter_kernel_only(sol_mod, bs, topk, local_experts, hidden_size, sta
     flat_topk_ids = topk_ids.reshape(-1).contiguous()
 
     packed_layout = torch.empty(2 * local_experts, dtype=torch.int32, device="cuda")
-    sorted_hidden = torch.empty(max_total_M, hidden_size, device="cuda", dtype=torch.bfloat16)
+    sorted_hidden = torch.empty(max_total_M, hidden_size, device="cuda", dtype=torch.float8_e4m3fn)
+    sorted_scales = torch.zeros(max_total_M, device="cuda", dtype=torch.float32)
     write_counters = torch.zeros(local_experts, dtype=torch.int32, device="cuda")
     output_index = torch.full((num_elements,), -1, dtype=torch.int32, device="cuda")
 
@@ -249,7 +254,9 @@ def bench_scatter_kernel_only(sol_mod, bs, topk, local_experts, hidden_size, sta
         packed_layout, write_counters, output_index,
         bs, topk, start_expert, local_experts,
         hidden_states.stride(0), sorted_hidden.stride(0),
-        HIDDEN_SIZE=hidden_size, HIDDEN_SIZE_PAD=HIDDEN_SIZE_PAD, num_warps=8,
+        HIDDEN_SIZE=hidden_size, HIDDEN_SIZE_PAD=HIDDEN_SIZE_PAD,
+        sorted_scales_ptr=sorted_scales, FP8_MAX=FP8_MAX,
+        num_warps=8,
     )
     torch.cuda.synchronize()
 
@@ -264,7 +271,9 @@ def bench_scatter_kernel_only(sol_mod, bs, topk, local_experts, hidden_size, sta
             packed_layout, write_counters, output_index,
             bs, topk, start_expert, local_experts,
             hidden_states.stride(0), sorted_hidden.stride(0),
-            HIDDEN_SIZE=hidden_size, HIDDEN_SIZE_PAD=HIDDEN_SIZE_PAD, num_warps=8,
+            HIDDEN_SIZE=hidden_size, HIDDEN_SIZE_PAD=HIDDEN_SIZE_PAD,
+            sorted_scales_ptr=sorted_scales, FP8_MAX=FP8_MAX,
+            num_warps=8,
         )
     return _run
 
@@ -288,7 +297,7 @@ def bench_gather(sol_mod, bs, topk, local_experts, hidden_size, start_expert):
         torch.randn(bs, topk, device="cuda", dtype=torch.float32), dim=-1,
     )
     max_total_M = bs * topk + local_experts * (ALIGNMENT - 1)
-    _, _, output_index = sol_mod.moe_align_and_scatter(
+    _, _, output_index, _ = sol_mod.moe_align_and_scatter(
         hidden_states, topk_ids, local_experts, start_expert, max_total_M,
     )
     gemm_output = torch.randn(max_total_M, hidden_size, device="cuda", dtype=torch.bfloat16)
