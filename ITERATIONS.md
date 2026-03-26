@@ -16,3 +16,4 @@
 | 9 | Atomic on packed_layout (remove m_offset load) | 0.0212 | 0.0113 | 0.0325 | slightly worse, reverted |
 | 10 | Gather evict_first output stores | 0.0208 | 0.0116 | 0.0324 | gather worse, reverted |
 | 11 | Gather BLOCK_D=512 | 0.0202 | 0.0134 | 0.0336 | gather worse, reverted |
+| 12 | Autotune count kernel num_warps=8 | 0.0197 | 0.0115 | 0.0312 | improved -1.3% |

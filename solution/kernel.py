@@ -19,6 +19,10 @@ FP8_E4M3_MAX = 448.0
 # Kernel 1 — fused histogram + prefix-sum  (single program, grid=1)
 # ---------------------------------------------------------------------------
 
+@triton.autotune(
+    configs=[triton.Config({}, num_warps=8, num_stages=1)],
+    key=['BLOCK_SIZE'],
+)
 @triton.jit
 def _count_and_compute_layout_kernel(
     topk_ids_ptr,
