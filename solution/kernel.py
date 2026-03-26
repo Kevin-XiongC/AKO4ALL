@@ -42,8 +42,8 @@ def _count_and_compute_layout_kernel(
     aligned = ((counts + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT
     offsets = tl.cumsum(aligned, axis=0) - aligned
 
-    tl.store(packed_layout_ptr + g_offs, offsets, mask=g_mask)
-    tl.store(packed_layout_ptr + num_groups + g_offs, counts, mask=g_mask)
+    tl.store(packed_layout_ptr + g_offs, offsets, mask=g_mask, eviction_policy="evict_last")
+    tl.store(packed_layout_ptr + num_groups + g_offs, counts, mask=g_mask, eviction_policy="evict_last")
 
 
 # ---------------------------------------------------------------------------
