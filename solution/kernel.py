@@ -252,7 +252,7 @@ def moe_align_and_scatter(
     if max_total_M is None:
         max_total_M = num_elements + num_groups * (alignment - 1)
 
-    flat_topk_ids = topk_ids.reshape(-1).contiguous()
+    flat_topk_ids = topk_ids.view(-1)
 
     packed_layout = torch.empty(2 * num_groups, dtype=torch.int32, device=device)
     BLOCK_SIZE = 1024
@@ -269,7 +269,7 @@ def moe_align_and_scatter(
         max_total_M, hidden_dim, device=device, dtype=hidden_states.dtype,
     )
     write_counters = torch.zeros(num_groups, dtype=torch.int32, device=device)
-    output_index = torch.full((bs * topk,), -1, dtype=torch.int32, device=device)
+    output_index = torch.empty(bs * topk, dtype=torch.int32, device=device)
 
     HIDDEN_SIZE_PAD = triton.next_power_of_2(hidden_dim)
     grid_size = min(bs, 1024 * 8)
@@ -305,8 +305,8 @@ def moe_gather(
     topk = topk_weights.shape[1]
     out_dim = gemm_output.shape[1]
 
-    flat_weights = topk_weights.reshape(-1).contiguous()
-    flat_index = output_index.reshape(-1).contiguous()
+    flat_weights = topk_weights.view(-1)
+    flat_index = output_index.view(-1)
 
     output = torch.zeros(bs, out_dim, device=gemm_output.device, dtype=gemm_output.dtype)
 
