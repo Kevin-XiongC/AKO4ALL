@@ -20,3 +20,4 @@
 | 13 | Autotune scatter single config | — | — | — | num_warps conflict with bench, reverted |
 | 14 | Count num_warps=16, gather num_stages=3 | 0.0206 | 0.0114 | 0.0321 | combined worse; count=16 alone ~0.0310 avg — kept num_warps=16 |
 | 15 | Count autotune 16 vs 32 warps | — | — | 0.0314 avg | multi-config overhead, kept single 16 |
+| 16 | Speculative hidden_states load before pre-check | 0.0200 | 0.0116 | 0.0317 avg | wasted reads offset latency hiding, reverted |
