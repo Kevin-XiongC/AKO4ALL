@@ -33,6 +33,8 @@
 | 26 | output_index evict policies | 0.0279 | 0.0167 | 0.0447 | stable |
 | 27 | packed_layout evict_last store | 0.0281 | 0.0166 | 0.0446 | stable best |
 | 28 | gather output evict policies | - | 0.0229/0.0169 | - | evict_last hurts, evict_first neutral |
+| 29 | torch.compile gather | 0.0290 | 0.2640 | 0.2931 | terrible |
+| 30 | scatter read evict_first | 0.0356 | 0.0169 | 0.0525 | regression — evict_last essential |
 
 ## Iterations
 
