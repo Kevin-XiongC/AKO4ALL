@@ -12,6 +12,7 @@
 | 5 | wrapper optimizations | 0.0407 | 0.0331 | 0.0738 | no change |
 | 6 | torch.empty + BLOCK_D tuning | 0.0408 | 0.0309 | 0.0718 | improved |
 | 7 | skip data load for non-local tokens | 0.0370 | 0.0305 | 0.0675 | improved |
+| 8 | gather BLOCK_D=1024, num_warps=8 | 0.0372 | 0.0301 | 0.0673 | marginal |
 
 ## Iterations
 

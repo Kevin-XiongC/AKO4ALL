@@ -321,7 +321,10 @@ def moe_gather(
 
     output = torch.empty(bs, out_dim, device=gemm_output.device, dtype=gemm_output.dtype)
 
-    if out_dim % 512 == 0:
+    if out_dim % 1024 == 0:
+        BLOCK_D = 1024
+        num_warps = 8
+    elif out_dim % 512 == 0:
         BLOCK_D = 512
         num_warps = 4
     elif out_dim % 128 == 0:
