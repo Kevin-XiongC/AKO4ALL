@@ -4,16 +4,17 @@ Triton kernels for MoE token scatter/gather with DeepGEMM m-offset layout.
 Scatter (moe_align_and_scatter):
     Reorders hidden_states by expert assignment into 128-aligned m-offset
     layout for deep_gemm.m_grouped_fp8_gemm_nt_moffset.
+    Fuses FP8 per-token quantization: outputs float8_e4m3fn + per-row scales.
 
 Gather (moe_gather):
     Reverses the m-offset layout after GEMM, weighting by topk_weights and
     accumulating back to original token positions.
 
 Usage:
-    sorted_hidden, packed_layout, output_index = moe_align_and_scatter(
+    sorted_hidden, packed_layout, output_index, sorted_scales = moe_align_and_scatter(
         hidden_states, topk_ids, num_groups, start_expert, max_total_M
     )
-    # ... DeepGEMM GEMM on sorted_hidden → gemm_output (m-offset layout) ...
+    # ... DeepGEMM FP8 GEMM on sorted_hidden + sorted_scales → gemm_output ...
     output = moe_gather(gemm_output, topk_weights, output_index)
 """
 
@@ -23,6 +24,7 @@ import triton
 import triton.language as tl
 
 ALIGNMENT = 128
+FP8_E4M3_MAX = 448.0
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +66,7 @@ def _count_and_compute_layout_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 2 — scatter tokens (ep_scatter style: per-token, full-row copy)
+# Kernel 2 — scatter tokens with fused FP8 quantization
 # ---------------------------------------------------------------------------
 
 @triton.jit
@@ -83,6 +85,8 @@ def _scatter_tokens_kernel(
     stride_sh_m,
     HIDDEN_SIZE: tl.constexpr,
     HIDDEN_SIZE_PAD: tl.constexpr,
+    sorted_scales_ptr=None,
+    FP8_MAX: tl.constexpr = 448,
 ):
     start_token = tl.program_id(0)
     grid_size = tl.num_programs(0)
@@ -96,7 +100,16 @@ def _scatter_tokens_kernel(
         in_data = tl.load(
             hidden_states_ptr + token_idx * stride_hs_m + h_offs,
             mask=h_mask,
+            other=0.0,
         )
+
+        # FP8 per-token quantization
+        in_f32 = in_data.to(tl.float32)
+        max_val = tl.max(tl.where(h_mask, tl.abs(in_f32), 0.0))
+        scale = max_val / FP8_MAX
+        scale_inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
+        quantized = in_f32 * scale_inv
+        fp8_data = quantized.to(tl.float8e4nv)
 
         topk_base = token_idx_i32 * topk
         for k in range(topk):
@@ -111,9 +124,10 @@ def _scatter_tokens_kernel(
                 tl.store(output_index_ptr + topk_base + k, (m_offset + pos))
                 tl.store(
                     sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
-                    in_data,
+                    fp8_data,
                     mask=h_mask,
                 )
+                tl.store(sorted_scales_ptr + dst_row, scale)
             else:
                 tl.store(output_index_ptr + topk_base + k, -1)
 
@@ -181,23 +195,16 @@ def moe_align_and_scatter(
     start_expert: int,
     max_total_M: int | None = None,
     alignment: int = ALIGNMENT,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Reorder tokens by expert assignment for DeepGEMM m-offset layout.
-
-    Args:
-        hidden_states: [bs, hidden_dim] input activations (bf16)
-        topk_ids:      [bs, topk]       expert indices per token (int32)
-        num_groups:    number of local experts
-        start_expert:  global id of the first local expert
-        max_total_M:   pre-allocated M dimension (computed if None)
-        alignment:     row alignment (default 128)
+    Reorder tokens by expert assignment for DeepGEMM m-offset layout,
+    with fused FP8 per-token quantization.
 
     Returns:
-        sorted_hidden: [max_total_M, hidden_dim]  reordered activations
+        sorted_hidden: [max_total_M, hidden_dim]  FP8 e4m3fn quantized activations
         packed_layout: [2 * num_groups]            [m_offsets | m_counts]
-        output_index:  [bs * topk]                 reverse mapping for gather
-                       (-1 for non-local experts)
+        output_index:  [bs * topk]                 reverse mapping (-1 for non-local)
+        sorted_scales: [max_total_M]               per-row FP8 scale (float32)
     """
     bs, hidden_dim = hidden_states.shape
     topk = topk_ids.shape[1]
@@ -221,8 +228,9 @@ def moe_align_and_scatter(
     )
 
     sorted_hidden = torch.empty(
-        max_total_M, hidden_dim, device=device, dtype=hidden_states.dtype,
+        max_total_M, hidden_dim, device=device, dtype=torch.float8_e4m3fn,
     )
+    sorted_scales = torch.zeros(max_total_M, device=device, dtype=torch.float32)
     write_counters = torch.zeros(num_groups, dtype=torch.int32, device=device)
     output_index = torch.full((bs * topk,), -1, dtype=torch.int32, device=device)
 
@@ -234,10 +242,12 @@ def moe_align_and_scatter(
         bs, topk, start_expert, num_groups,
         hidden_states.stride(0), sorted_hidden.stride(0),
         HIDDEN_SIZE=hidden_dim, HIDDEN_SIZE_PAD=HIDDEN_SIZE_PAD,
+        sorted_scales_ptr=sorted_scales,
+        FP8_MAX=FP8_E4M3_MAX,
         num_warps=8,
     )
 
-    return sorted_hidden, packed_layout, output_index
+    return sorted_hidden, packed_layout, output_index, sorted_scales
 
 
 def moe_gather(
@@ -247,14 +257,6 @@ def moe_gather(
 ) -> torch.Tensor:
     """
     Gather GEMM results back to original token order with gating weights.
-
-    Args:
-        gemm_output:   [max_total_M, out_dim]  GEMM output in m-offset layout
-        topk_weights:  [bs, topk]              gating weights (float32)
-        output_index:  [bs * topk]             from moe_align_and_scatter
-
-    Returns:
-        output: [bs, out_dim]  weighted sum over local experts per token
     """
     bs = topk_weights.shape[0]
     topk = topk_weights.shape[1]
@@ -266,7 +268,7 @@ def moe_gather(
     output = torch.zeros(bs, out_dim, device=gemm_output.device, dtype=gemm_output.dtype)
 
     BLOCK_D = 128 if out_dim % 1024 != 0 else 1024
-    assert out_dim % BLOCK_D == 0, f"out_dim={out_dim} must be divisible by BLOCK_D={BLOCK_D}"
+    assert out_dim % BLOCK_D == 0
 
     grid = (out_dim // BLOCK_D, min(bs, 1024))
     _gather_tokens_kernel[grid](

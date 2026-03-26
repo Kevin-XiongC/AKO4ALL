@@ -1,13 +1,9 @@
 """
 Triton kernels for MoE token scatter/gather with DeepGEMM m-offset layout.
 
-Optimizations applied (H200):
-  - tl.histogram in count kernel
-  - No eviction policies on scatter/count (H200 defaults better)
-  - tl.static_range for topk loop
-  - Pre-check for non-local tokens
-  - Gather: evict_last on reads, BLOCK_D=1024, num_warps=4, grid tokens=512
-  - torch.empty for output buffers
+Scatter outputs FP8 (float8_e4m3fn) quantized activations + per-row scales,
+fusing the per-token quantization into the scatter to avoid a second data pass
+and halve write bandwidth.
 """
 
 import math
@@ -16,6 +12,7 @@ import triton
 import triton.language as tl
 
 ALIGNMENT = 128
+FP8_E4M3_MAX = 448.0
 
 
 # ---------------------------------------------------------------------------
@@ -89,27 +86,30 @@ def _scatter_positions_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 2b — data copy (2D grid: hidden_chunks x tokens)
+# Kernel 2b — fused FP8 quantize + scatter data (1D grid, full row)
 # ---------------------------------------------------------------------------
 
 @triton.jit
-def _scatter_data_kernel(
+def _scatter_quantize_kernel(
     hidden_states_ptr,
     sorted_hidden_ptr,
+    sorted_scales_ptr,
     output_index_ptr,
     num_tokens,
     topk: tl.constexpr,
     stride_hs_m,
     stride_sh_m,
-    BLOCK_H: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    HIDDEN_SIZE_PAD: tl.constexpr,
+    FP8_MAX: tl.constexpr,
 ):
-    h_block = tl.program_id(0)
-    token_start = tl.program_id(1)
-    grid_tokens = tl.num_programs(1)
+    start_token = tl.program_id(0)
+    grid_size = tl.num_programs(0)
 
-    h_offs = h_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_offs = tl.arange(0, HIDDEN_SIZE_PAD)
+    h_mask = h_offs < HIDDEN_SIZE
 
-    for token_idx_i32 in range(token_start, num_tokens, grid_tokens):
+    for token_idx_i32 in range(start_token, num_tokens, grid_size):
         token_idx = token_idx_i32.to(tl.int64)
         topk_base = token_idx_i32 * topk
 
@@ -120,22 +120,36 @@ def _scatter_data_kernel(
             any_local |= (idx >= 0)
 
         if any_local:
+            # Load bf16 hidden row
             in_data = tl.load(
                 hidden_states_ptr + token_idx * stride_hs_m + h_offs,
+                mask=h_mask,
+                other=0.0,
             )
 
+            # FP8 per-token quantization: find max abs → compute scale → quantize
+            in_f32 = in_data.to(tl.float32)
+            max_val = tl.max(tl.where(h_mask, tl.abs(in_f32), 0.0))
+            scale = max_val / FP8_MAX
+            scale_inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
+            quantized = in_f32 * scale_inv
+            fp8_data = quantized.to(tl.float8e4nv)
+
+            # Store FP8 data + scale for each local expert destination
             for k in tl.static_range(topk):
                 dst_row_i32 = tl.load(output_index_ptr + topk_base + k)
                 if dst_row_i32 >= 0:
                     dst_row = dst_row_i32.to(tl.int64)
                     tl.store(
                         sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
-                        in_data,
+                        fp8_data,
+                        mask=h_mask,
                     )
+                    tl.store(sorted_scales_ptr + dst_row, scale)
 
 
 # ---------------------------------------------------------------------------
-# Kernel 2 — scatter tokens (bench calls this directly)
+# Kernel 2 — scatter tokens (original API, now with FP8 quantization)
 # ---------------------------------------------------------------------------
 
 @triton.jit
@@ -154,6 +168,8 @@ def _scatter_tokens_kernel(
     stride_sh_m,
     HIDDEN_SIZE: tl.constexpr,
     HIDDEN_SIZE_PAD: tl.constexpr,
+    sorted_scales_ptr=None,
+    FP8_MAX: tl.constexpr = 448,
 ):
     start_token = tl.program_id(0)
     grid_size = tl.num_programs(0)
@@ -176,14 +192,22 @@ def _scatter_tokens_kernel(
             in_data = tl.load(
                 hidden_states_ptr + token_idx * stride_hs_m + h_offs,
                 mask=h_mask,
+                other=0.0,
             )
+
+            # FP8 per-token quantization
+            in_f32 = in_data.to(tl.float32)
+            max_val = tl.max(tl.where(h_mask, tl.abs(in_f32), 0.0))
+            scale = max_val / FP8_MAX
+            scale_inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
+            quantized = in_f32 * scale_inv
+            fp8_data = quantized.to(tl.float8e4nv)
 
             for k in tl.static_range(topk):
                 expert_id = tl.load(topk_ids_ptr + topk_base + k)
                 local_id = expert_id - start_expert
 
                 if local_id >= 0 and local_id < num_groups:
-                    # Pre-load m_offset before atomic to overlap latency
                     m_offset = tl.load(packed_layout_ptr + local_id)
                     pos = tl.atomic_add(write_counters_ptr + local_id, 1)
                     dst_row = (m_offset + pos).to(tl.int64)
@@ -192,9 +216,10 @@ def _scatter_tokens_kernel(
                              (m_offset + pos))
                     tl.store(
                         sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
-                        in_data,
+                        fp8_data,
                         mask=h_mask,
                     )
+                    tl.store(sorted_scales_ptr + dst_row, scale)
                 else:
                     tl.store(output_index_ptr + topk_base + k, -1)
         else:
@@ -203,7 +228,7 @@ def _scatter_tokens_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 3 — gather
+# Kernel 3 — gather (unchanged — reads from gemm_output, not sorted_hidden)
 # ---------------------------------------------------------------------------
 
 @triton.jit
@@ -269,7 +294,17 @@ def moe_align_and_scatter(
     start_expert: int,
     max_total_M: int | None = None,
     alignment: int = ALIGNMENT,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Reorder tokens by expert assignment for DeepGEMM m-offset layout,
+    with fused FP8 per-token quantization.
+
+    Returns:
+        sorted_hidden: [max_total_M, hidden_dim]  FP8 e4m3fn quantized activations
+        packed_layout: [2 * num_groups]            [m_offsets | m_counts]
+        output_index:  [bs * topk]                 reverse mapping (-1 for non-local)
+        sorted_scales: [max_total_M]               per-row FP8 scale (float32)
+    """
     bs, hidden_dim = hidden_states.shape
     topk = topk_ids.shape[1]
     num_elements = bs * topk
@@ -280,6 +315,7 @@ def moe_align_and_scatter(
 
     flat_topk_ids = topk_ids.view(-1)
 
+    # Kernel 1: count + layout
     packed_layout = torch.empty(2 * num_groups, dtype=torch.int32, device=device)
     BLOCK_SIZE = min(4096, triton.next_power_of_2(num_elements))
     BLOCK_G = triton.next_power_of_2(num_groups)
@@ -291,13 +327,15 @@ def moe_align_and_scatter(
         BLOCK_SIZE=BLOCK_SIZE, NUM_ITERS=NUM_ITERS,
     )
 
+    # Allocate FP8 output + scales
     sorted_hidden = torch.empty(
-        max_total_M, hidden_dim, device=device, dtype=hidden_states.dtype,
+        max_total_M, hidden_dim, device=device, dtype=torch.float8_e4m3fn,
     )
+    sorted_scales = torch.zeros(max_total_M, device=device, dtype=torch.float32)
     write_counters = torch.zeros(num_groups, dtype=torch.int32, device=device)
     output_index = torch.empty(bs * topk, dtype=torch.int32, device=device)
 
-    # Pass 1: Position allocation
+    # Kernel 2a: Position allocation
     pos_grid = min(bs, 1024)
     _scatter_positions_kernel[(pos_grid,)](
         flat_topk_ids, packed_layout, write_counters, output_index,
@@ -305,22 +343,19 @@ def moe_align_and_scatter(
         num_warps=4,
     )
 
-    # Pass 2: Data copy (2D grid)
-    BLOCK_H = 1024
-    if hidden_dim % BLOCK_H != 0:
-        BLOCK_H = 128
-    assert hidden_dim % BLOCK_H == 0
-    num_h_blocks = hidden_dim // BLOCK_H
-    data_grid = (num_h_blocks, min(bs, 1024))
-    _scatter_data_kernel[data_grid](
-        hidden_states, sorted_hidden, output_index,
+    # Kernel 2b: Fused FP8 quantize + data copy (1D, full row)
+    HIDDEN_SIZE_PAD = triton.next_power_of_2(hidden_dim)
+    grid_size = min(bs, 1024)
+    _scatter_quantize_kernel[(grid_size,)](
+        hidden_states, sorted_hidden, sorted_scales, output_index,
         bs, topk,
         hidden_states.stride(0), sorted_hidden.stride(0),
-        BLOCK_H=BLOCK_H,
-        num_warps=4,
+        HIDDEN_SIZE=hidden_dim, HIDDEN_SIZE_PAD=HIDDEN_SIZE_PAD,
+        FP8_MAX=FP8_E4M3_MAX,
+        num_warps=8,
     )
 
-    return sorted_hidden, packed_layout, output_index
+    return sorted_hidden, packed_layout, output_index, sorted_scales
 
 
 def moe_gather(
@@ -328,6 +363,10 @@ def moe_gather(
     topk_weights: torch.Tensor,
     output_index: torch.Tensor,
 ) -> torch.Tensor:
+    """
+    Gather GEMM results back to original token order with gating weights.
+    Unchanged — reads from gemm_output, not sorted_hidden.
+    """
     bs = topk_weights.shape[0]
     topk = topk_weights.shape[1]
     out_dim = gemm_output.shape[1]
