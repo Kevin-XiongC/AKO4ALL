@@ -145,6 +145,7 @@ def _scatter_quantize_kernel(
                 hidden_states_ptr + token_idx * stride_hs_m + h_offs,
                 mask=h_mask,
                 other=0.0,
+                eviction_policy="evict_last",
             )
 
             in_f32 = in_data.to(tl.float32)
