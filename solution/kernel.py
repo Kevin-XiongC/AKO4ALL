@@ -1,11 +1,12 @@
 """
 Triton kernels for MoE token scatter/gather with DeepGEMM m-offset layout.
 
-Optimizations applied:
+Optimizations applied (H200):
   - tl.histogram replaces O(BLOCK_SIZE * BLOCK_G) inner loop in count kernel
-  - Skip hidden row load for tokens with no local experts (~34% skip rate)
-  - L2 cache eviction policies: evict_last on reads (keep hot), evict_first on writes (don't pollute)
-  - torch.empty instead of torch.zeros for gather output
+  - 2-pass scatter: lightweight position allocation + 2D data copy kernel
+  - 2D scatter grid (hidden_chunks x tokens) for 5x more parallelism on H200
+  - L2 cache eviction policies: evict_last on reads, evict_first on writes
+  - torch.empty instead of torch.zeros for output buffers
   - BLOCK_D=1024 / num_warps=8 / num_stages=1 for gather kernel
 """
 
@@ -57,7 +58,92 @@ def _count_and_compute_layout_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 2 — scatter tokens
+# Kernel 2a — position allocation only (lightweight, 1D grid)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _scatter_positions_kernel(
+    topk_ids_ptr,
+    packed_layout_ptr,
+    write_counters_ptr,
+    output_index_ptr,
+    num_tokens,
+    topk: tl.constexpr,
+    start_expert,
+    num_groups,
+):
+    start_token = tl.program_id(0)
+    grid_size = tl.num_programs(0)
+
+    for token_idx_i32 in range(start_token, num_tokens, grid_size):
+        topk_base = token_idx_i32 * topk
+
+        for k in range(topk):
+            expert_id = tl.load(topk_ids_ptr + topk_base + k)
+            local_id = expert_id - start_expert
+
+            if local_id >= 0 and local_id < num_groups:
+                pos = tl.atomic_add(write_counters_ptr + local_id, 1)
+                m_offset = tl.load(packed_layout_ptr + local_id,
+                                   eviction_policy="evict_last")
+                tl.store(output_index_ptr + topk_base + k,
+                         (m_offset + pos),
+                         eviction_policy="evict_last")
+            else:
+                tl.store(output_index_ptr + topk_base + k, -1,
+                         eviction_policy="evict_first")
+
+
+# ---------------------------------------------------------------------------
+# Kernel 2b — data copy (2D grid: hidden_chunks x tokens)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _scatter_data_kernel(
+    hidden_states_ptr,
+    sorted_hidden_ptr,
+    output_index_ptr,
+    num_tokens,
+    topk: tl.constexpr,
+    stride_hs_m,
+    stride_sh_m,
+    BLOCK_H: tl.constexpr,
+):
+    h_block = tl.program_id(0)
+    token_start = tl.program_id(1)
+    grid_tokens = tl.num_programs(1)
+
+    h_offs = h_block * BLOCK_H + tl.arange(0, BLOCK_H)
+
+    for token_idx_i32 in range(token_start, num_tokens, grid_tokens):
+        token_idx = token_idx_i32.to(tl.int64)
+        topk_base = token_idx_i32 * topk
+
+        # Check if any local expert before loading data
+        any_local: tl.int1 = False
+        for kk in tl.static_range(topk):
+            idx = tl.load(output_index_ptr + topk_base + kk)
+            any_local |= (idx >= 0)
+
+        if any_local:
+            in_data = tl.load(
+                hidden_states_ptr + token_idx * stride_hs_m + h_offs,
+                eviction_policy="evict_last",
+            )
+
+            for k in tl.static_range(topk):
+                dst_row_i32 = tl.load(output_index_ptr + topk_base + k)
+                if dst_row_i32 >= 0:
+                    dst_row = dst_row_i32.to(tl.int64)
+                    tl.store(
+                        sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
+                        in_data,
+                        eviction_policy="evict_first",
+                    )
+
+
+# ---------------------------------------------------------------------------
+# Keep the old scatter kernel name for API compatibility (bench imports it)
 # ---------------------------------------------------------------------------
 
 @triton.jit
@@ -87,7 +173,6 @@ def _scatter_tokens_kernel(
         token_idx = token_idx_i32.to(tl.int64)
         topk_base = token_idx_i32 * topk
 
-        # Pre-check: does this token have any local experts?
         any_local: tl.int32 = 0
         for kk in tl.static_range(topk):
             eid = tl.load(topk_ids_ptr + topk_base + kk)
@@ -223,15 +308,25 @@ def moe_align_and_scatter(
     write_counters = torch.zeros(num_groups, dtype=torch.int32, device=device)
     output_index = torch.empty(bs * topk, dtype=torch.int32, device=device)
 
-    HIDDEN_SIZE_PAD = triton.next_power_of_2(hidden_dim)
-    grid_size = min(bs, 1024 * 8)
-    _scatter_tokens_kernel[(grid_size,)](
-        hidden_states, sorted_hidden, flat_topk_ids,
-        packed_layout, write_counters, output_index,
+    # Pass 1: Position allocation (lightweight, no data movement)
+    pos_grid = min(bs, 1024)
+    _scatter_positions_kernel[(pos_grid,)](
+        flat_topk_ids, packed_layout, write_counters, output_index,
         bs, topk, start_expert, num_groups,
+        num_warps=4,
+    )
+
+    # Pass 2: Data copy (2D grid: hidden_chunks x tokens)
+    BLOCK_H = 1024
+    assert hidden_dim % BLOCK_H == 0, f"hidden_dim={hidden_dim} must be divisible by BLOCK_H={BLOCK_H}"
+    num_h_blocks = hidden_dim // BLOCK_H
+    data_grid = (num_h_blocks, min(bs, 1024))
+    _scatter_data_kernel[data_grid](
+        hidden_states, sorted_hidden, output_index,
+        bs, topk,
         hidden_states.stride(0), sorted_hidden.stride(0),
-        HIDDEN_SIZE=hidden_dim, HIDDEN_SIZE_PAD=HIDDEN_SIZE_PAD,
-        num_warps=8,
+        BLOCK_H=BLOCK_H,
+        num_warps=4,
     )
 
     return sorted_hidden, packed_layout, output_index
