@@ -100,7 +100,7 @@ def _scatter_tokens_kernel(
                     m_offset = tl.load(packed_layout_ptr + local_id, eviction_policy="evict_last")
                     dst_row = (m_offset + pos).to(tl.int64)
 
-                    tl.store(output_index_ptr + topk_base + k, (m_offset + pos))
+                    tl.store(output_index_ptr + topk_base + k, (m_offset + pos), eviction_policy="evict_last")
                     tl.store(
                         sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
                         in_data,
@@ -108,10 +108,10 @@ def _scatter_tokens_kernel(
                         eviction_policy="evict_first",
                     )
                 else:
-                    tl.store(output_index_ptr + topk_base + k, -1)
+                    tl.store(output_index_ptr + topk_base + k, -1, eviction_policy="evict_first")
         else:
             for k in tl.static_range(topk):
-                tl.store(output_index_ptr + topk_base + k, -1)
+                tl.store(output_index_ptr + topk_base + k, -1, eviction_policy="evict_first")
 
 
 # ---------------------------------------------------------------------------
