@@ -25,6 +25,7 @@
 | 18 | gather grid tokens=512 | 0.0369 | 0.0376 | 0.0745 | regression |
 | 19 | gather evict_last on reads | 0.0370 | 0.0177 | 0.0547 | **major improvement** |
 | 20 | scatter evict_last on reads | 0.0288 | 0.0175 | 0.0463 | **major improvement** |
+| 21 | + scatter write evict_first | 0.0292 | 0.0174 | 0.0466 | stable best |
 
 ## Iterations
 
