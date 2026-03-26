@@ -284,8 +284,3 @@ def moe_gather(
     output_index: torch.Tensor,
 ) -> torch.Tensor:
     return _gather_triton(gemm_output, topk_weights, output_index)
-
-
-# Expose for backward compatibility
-def _gather_tokens_tiled_kernel(*args, **kwargs):
-    pass

@@ -19,6 +19,10 @@
 | 12 | num_stages=3 gather | 0.0369 | 0.0307 | 0.0676 | no change |
 | 13 | num_warps=16 / pytorch gather | 0.0369 | 0.0332/0.247 | 0.0701 | regression |
 | 14 | inline tiled scatter writes | 0.0425 | 0.0307 | 0.0732 | regression — reverted |
+| 15 | stability check | 0.0369 | 0.0309 | 0.0678 | same |
+| 16 | static_range topk | 0.0369 | 0.0306 | 0.0675 | noise |
+| 17 | static_range count loop | 0.0375 | 0.0309 | 0.0684 | worse at high bs |
+| 18 | gather grid tokens=512 | 0.0369 | 0.0376 | 0.0745 | regression |
 
 ## Iterations
 
