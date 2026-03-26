@@ -168,6 +168,53 @@ def _gather_tokens_kernel(
         )
 
 
+@triton.jit
+def _gather_tokens_tiled_kernel(
+    gemm_output_ptr,
+    topk_weights_ptr,
+    output_index_ptr,
+    output_ptr,
+    num_tokens,
+    topk: tl.constexpr,
+    stride_gemm_m,
+    stride_out_m,
+    OUT_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    NUM_D_BLOCKS: tl.constexpr,
+):
+    start_token = tl.program_id(0)
+    grid_tokens = tl.num_programs(0)
+
+    for token_idx_i32 in range(start_token, num_tokens, grid_tokens):
+        token_idx = token_idx_i32.to(tl.int64)
+        topk_base = token_idx_i32 * topk
+
+        for d_block in tl.static_range(NUM_D_BLOCKS):
+            d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+            acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+            for k in tl.static_range(topk):
+                src_row_i32 = tl.load(output_index_ptr + topk_base + k)
+
+                if src_row_i32 >= 0:
+                    src_row = src_row_i32.to(tl.int64)
+                    weight = tl.load(topk_weights_ptr + topk_base + k)
+
+                    val = tl.load(
+                        gemm_output_ptr
+                        + src_row * stride_gemm_m
+                        + d_offs,
+                    )
+                    acc += val.to(tl.float32) * weight
+
+            tl.store(
+                output_ptr
+                + token_idx * stride_out_m
+                + d_offs,
+                acc.to(output_ptr.dtype.element_ty),
+            )
+
+
 # ---------------------------------------------------------------------------
 # Python Wrappers
 # ---------------------------------------------------------------------------
