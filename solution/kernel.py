@@ -1,20 +1,5 @@
 """
 Triton kernels for MoE token scatter/gather with DeepGEMM m-offset layout.
-
-Scatter (moe_align_and_scatter):
-    Reorders hidden_states by expert assignment into 128-aligned m-offset
-    layout for deep_gemm.m_grouped_fp8_gemm_nt_moffset.
-
-Gather (moe_gather):
-    Reverses the m-offset layout after GEMM, weighting by topk_weights and
-    accumulating back to original token positions.
-
-Usage:
-    sorted_hidden, packed_layout, output_index = moe_align_and_scatter(
-        hidden_states, topk_ids, num_groups, start_expert, max_total_M
-    )
-    # ... DeepGEMM GEMM on sorted_hidden → gemm_output (m-offset layout) ...
-    output = moe_gather(gemm_output, topk_weights, output_index)
 """
 
 import math
@@ -62,7 +47,7 @@ def _count_and_compute_layout_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 2 — scatter tokens (ep_scatter style: per-token, full-row copy)
+# Kernel 2 — scatter tokens
 # ---------------------------------------------------------------------------
 
 @triton.jit
@@ -119,6 +104,7 @@ def _scatter_tokens_kernel(
                         sorted_hidden_ptr + dst_row * stride_sh_m + h_offs,
                         in_data,
                         mask=h_mask,
+                        eviction_policy="evict_first",
                     )
                 else:
                     tl.store(output_index_ptr + topk_base + k, -1)
@@ -128,7 +114,7 @@ def _scatter_tokens_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 3 — gather (output_index-only, no topk_ids dependency)
+# Kernel 3 — gather
 # ---------------------------------------------------------------------------
 
 @triton.jit
@@ -179,53 +165,6 @@ def _gather_tokens_kernel(
         )
 
 
-@triton.jit
-def _gather_tokens_tiled_kernel(
-    gemm_output_ptr,
-    topk_weights_ptr,
-    output_index_ptr,
-    output_ptr,
-    num_tokens,
-    topk: tl.constexpr,
-    stride_gemm_m,
-    stride_out_m,
-    OUT_DIM: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    NUM_D_BLOCKS: tl.constexpr,
-):
-    start_token = tl.program_id(0)
-    grid_tokens = tl.num_programs(0)
-
-    for token_idx_i32 in range(start_token, num_tokens, grid_tokens):
-        token_idx = token_idx_i32.to(tl.int64)
-        topk_base = token_idx_i32 * topk
-
-        for d_block in tl.static_range(NUM_D_BLOCKS):
-            d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
-            acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-
-            for k in tl.static_range(topk):
-                src_row_i32 = tl.load(output_index_ptr + topk_base + k)
-
-                if src_row_i32 >= 0:
-                    src_row = src_row_i32.to(tl.int64)
-                    weight = tl.load(topk_weights_ptr + topk_base + k)
-
-                    val = tl.load(
-                        gemm_output_ptr
-                        + src_row * stride_gemm_m
-                        + d_offs,
-                    )
-                    acc += val.to(tl.float32) * weight
-
-            tl.store(
-                output_ptr
-                + token_idx * stride_out_m
-                + d_offs,
-                acc.to(output_ptr.dtype.element_ty),
-            )
-
-
 # ---------------------------------------------------------------------------
 # Python Wrappers
 # ---------------------------------------------------------------------------
@@ -238,23 +177,6 @@ def moe_align_and_scatter(
     max_total_M: int | None = None,
     alignment: int = ALIGNMENT,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Reorder tokens by expert assignment for DeepGEMM m-offset layout.
-
-    Args:
-        hidden_states: [bs, hidden_dim] input activations (bf16)
-        topk_ids:      [bs, topk]       expert indices per token (int32)
-        num_groups:    number of local experts
-        start_expert:  global id of the first local expert
-        max_total_M:   pre-allocated M dimension (computed if None)
-        alignment:     row alignment (default 128)
-
-    Returns:
-        sorted_hidden: [max_total_M, hidden_dim]  reordered activations
-        packed_layout: [2 * num_groups]            [m_offsets | m_counts]
-        output_index:  [bs * topk]                 reverse mapping for gather
-                       (-1 for non-local experts)
-    """
     bs, hidden_dim = hidden_states.shape
     topk = topk_ids.shape[1]
     num_elements = bs * topk
@@ -301,17 +223,6 @@ def moe_gather(
     topk_weights: torch.Tensor,
     output_index: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Gather GEMM results back to original token order with gating weights.
-
-    Args:
-        gemm_output:   [max_total_M, out_dim]  GEMM output in m-offset layout
-        topk_weights:  [bs, topk]              gating weights (float32)
-        output_index:  [bs * topk]             from moe_align_and_scatter
-
-    Returns:
-        output: [bs, out_dim]  weighted sum over local experts per token
-    """
     bs = topk_weights.shape[0]
     topk = topk_weights.shape[1]
     out_dim = gemm_output.shape[1]
@@ -333,7 +244,7 @@ def moe_gather(
     else:
         BLOCK_D = 64
         num_warps = 2
-    assert out_dim % BLOCK_D == 0, f"out_dim={out_dim} must be divisible by BLOCK_D={BLOCK_D}"
+    assert out_dim % BLOCK_D == 0
 
     grid = (out_dim // BLOCK_D, min(bs, 1024))
     _gather_tokens_kernel[grid](
