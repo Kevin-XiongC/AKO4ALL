@@ -3,7 +3,7 @@ Triton kernels for MoE token scatter/gather with DeepGEMM m-offset layout.
 
 Optimizations applied (H200):
   - tl.histogram replaces O(BLOCK_SIZE * BLOCK_G) inner loop in count kernel
-  - Larger BLOCK_SIZE (4096) for count kernel to reduce iterations
+  - BLOCK_SIZE=8192 for count kernel (single pass, no loop)
   - 2-pass scatter: lightweight position allocation + 2D data copy kernel
   - 2D scatter grid (hidden_chunks x tokens) for 5x more parallelism on H200
   - L2 cache eviction policies
@@ -293,8 +293,8 @@ def moe_align_and_scatter(
     flat_topk_ids = topk_ids.view(-1)
 
     packed_layout = torch.empty(2 * num_groups, dtype=torch.int32, device=device)
-    # Use larger BLOCK_SIZE to reduce iterations in count kernel
-    BLOCK_SIZE = min(4096, triton.next_power_of_2(num_elements))
+    # Use large BLOCK_SIZE to process all elements in 1-2 iterations
+    BLOCK_SIZE = min(8192, triton.next_power_of_2(num_elements))
     BLOCK_G = triton.next_power_of_2(num_groups)
     NUM_ITERS = math.ceil(num_elements / BLOCK_SIZE)
     _count_and_compute_layout_kernel[(1,)](
@@ -302,7 +302,6 @@ def moe_align_and_scatter(
         num_elements, start_expert, num_groups,
         BLOCK_G=BLOCK_G, ALIGNMENT=alignment,
         BLOCK_SIZE=BLOCK_SIZE, NUM_ITERS=NUM_ITERS,
-        num_warps=8,
     )
 
     sorted_hidden = torch.empty(
@@ -322,7 +321,6 @@ def moe_align_and_scatter(
     # Pass 2: Data copy (2D grid: hidden_chunks x tokens)
     BLOCK_H = 1024
     if hidden_dim % BLOCK_H != 0:
-        # Fallback for non-1024-aligned dims
         BLOCK_H = 128
     assert hidden_dim % BLOCK_H == 0
     num_h_blocks = hidden_dim // BLOCK_H
@@ -332,7 +330,7 @@ def moe_align_and_scatter(
         bs, topk,
         hidden_states.stride(0), sorted_hidden.stride(0),
         BLOCK_H=BLOCK_H,
-        num_warps=4,
+        num_warps=8,
     )
 
     return sorted_hidden, packed_layout, output_index
