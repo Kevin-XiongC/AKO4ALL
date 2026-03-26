@@ -477,7 +477,7 @@ def moe_gather(
         num_warps = 2
     assert out_dim % BLOCK_D == 0
 
-    grid = (out_dim // BLOCK_D, min(bs, 512))
+    grid = (out_dim // BLOCK_D, min(bs, 1024))
     _gather_tokens_kernel[grid](
         gemm_output, flat_weights, flat_index,
         output,

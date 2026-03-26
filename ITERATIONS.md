@@ -7,3 +7,4 @@
 | 0 | Per-token baseline (post per-group support) | 0.0237 | 0.0118 | 0.0355 | baseline |
 | 1 | Eviction policies (evict_first writes, evict_last reads) | 0.0230 | 0.0115 | 0.0346 | improved -2.5% |
 | 2 | Autotune scatter num_warps | — | — | — | CUDA error, reverted |
+| 3 | Gather grid (5, 1024) — more token parallelism | 0.0227 | 0.0113 | 0.0340 | improved -1.7% |
