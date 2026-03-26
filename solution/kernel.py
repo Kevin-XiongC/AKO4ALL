@@ -310,10 +310,21 @@ def moe_gather(
 
     output = torch.zeros(bs, out_dim, device=gemm_output.device, dtype=gemm_output.dtype)
 
-    BLOCK_D = 128 if out_dim % 1024 != 0 else 1024
+    # Try different BLOCK_D values for best performance
+    if out_dim % 512 == 0:
+        BLOCK_D = 512
+        num_warps = 4
+    elif out_dim % 256 == 0:
+        BLOCK_D = 256
+        num_warps = 4
+    elif out_dim % 128 == 0:
+        BLOCK_D = 128
+        num_warps = 2
+    else:
+        BLOCK_D = 64
+        num_warps = 2
     assert out_dim % BLOCK_D == 0, f"out_dim={out_dim} must be divisible by BLOCK_D={BLOCK_D}"
 
-    num_warps = 4 if BLOCK_D >= 512 else 2
     grid = (out_dim // BLOCK_D, min(bs, 1024))
     _gather_tokens_kernel[grid](
         gemm_output, flat_weights, flat_index,

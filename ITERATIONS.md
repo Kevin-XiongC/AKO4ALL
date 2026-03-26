@@ -8,6 +8,7 @@
 | 1 | tl.histogram in count kernel | 0.0408 | 0.0346 | 0.0754 | improved |
 | 2 | gather num_warps=4 | 0.0398 | 0.0338 | 0.0736 | improved |
 | 3 | tiled gather (1D grid) | 0.0407 | 0.0435 | 0.0842 | regression — reverted |
+| 4 | gather BLOCK_D=512, num_warps=4 | 0.0407 | 0.0329 | 0.0736 | improved |
 
 ## Iterations
 
