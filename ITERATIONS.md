@@ -13,6 +13,7 @@
 | 7 | Move oneshot clear after poll+fused_op | 1.01x | 0.1312 | no-change |
 | 8 | Lower oneshot threshold for 8 GPUs | **1.23x** | **0.1078** | **improved** |
 | 9 | Fine-tune threshold (3MB, 10MB) | — | — | threshold=5MB confirmed optimal |
+| 10 | Increase grid for small twoshot | **1.29x** | **0.1029** | **improved** |
 
 ## Key Improvement: Iter 8
 
@@ -24,6 +25,14 @@ The Python-side oneshot/twoshot threshold for 8 GPUs was 42MB (≈268 tokens), m
 - Large tokens (512+): unchanged
 
 The 8-rank Lamport polling is fundamentally inefficient: each rank writes to 8 buffers then polls 8 remote entries per element with volatile loads. The twoshot's structured scatter-reduce-allgather with barriers is much more efficient for these message sizes.
+
+### Iter 10 — Increase grid for small twoshot tokens
+
+With iter 8's lower threshold, tokens 64-256 now use twoshot but with very small grids (8-32 blocks). Changed grid_size to use `max(token_per_rank, token_num)` for twoshot when grid would otherwise be underutilized. Extra blocks skip phase 2 but accelerate phases 1 and 3.
+
+- Token 64: 0.048ms → 0.036ms (25% faster, 8→64 blocks)
+- Token 128: 0.045ms → 0.039ms (12% faster, 16→128 blocks)
+- Geomean: 0.1078ms → 0.1029ms (**4.5% improvement** on top of iter 8)
 
 ### Iter 9 — Fine-tune threshold
 
