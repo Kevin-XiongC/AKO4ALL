@@ -167,6 +167,59 @@ def _gather_tokens_kernel(
         )
 
 
+@triton.jit
+def _gather_persistent_kernel(
+    gemm_output_ptr,
+    topk_weights_ptr,
+    output_index_ptr,
+    output_ptr,
+    num_tokens,
+    topk: tl.constexpr,
+    stride_gemm_m,
+    stride_out_m,
+    num_d_blocks,
+    BLOCK_D: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total_tiles = num_d_blocks * num_tokens
+    d_offs = tl.arange(0, BLOCK_D)
+
+    for tile_id in range(pid, total_tiles, NUM_SMS):
+        block_idx = (tile_id % num_d_blocks)
+        token_idx_i32 = tile_id // num_d_blocks
+
+        block_idx_i64 = block_idx.to(tl.int64)
+        token_idx = token_idx_i32.to(tl.int64)
+        topk_base = token_idx_i32 * topk
+
+        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+        for k in tl.static_range(topk):
+            src_row_i32 = tl.load(output_index_ptr + topk_base + k, eviction_policy="evict_last")
+
+            if src_row_i32 >= 0:
+                src_row = src_row_i32.to(tl.int64)
+                weight = tl.load(topk_weights_ptr + topk_base + k, eviction_policy="evict_last")
+
+                val = tl.load(
+                    gemm_output_ptr
+                    + src_row * stride_gemm_m
+                    + block_idx_i64 * BLOCK_D
+                    + d_offs,
+                    eviction_policy="evict_last",
+                )
+                acc += val.to(tl.float32) * weight
+
+        tl.store(
+            output_ptr
+            + token_idx * stride_out_m
+            + block_idx_i64 * BLOCK_D
+            + d_offs,
+            acc.to(output_ptr.dtype.element_ty),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Python Wrappers
 # ---------------------------------------------------------------------------
