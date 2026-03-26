@@ -234,6 +234,7 @@ def _gather_tokens_kernel(
         topk_base = token_idx_i32 * topk
 
         acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+        base_addr = block_idx * BLOCK_D
 
         for k in tl.static_range(topk):
             src_row_i32 = tl.load(output_index_ptr + topk_base + k,
@@ -247,7 +248,7 @@ def _gather_tokens_kernel(
                 val = tl.load(
                     gemm_output_ptr
                     + src_row * stride_gemm_m
-                    + block_idx * BLOCK_D
+                    + base_addr
                     + d_offs,
                     eviction_policy="evict_last",
                 )
@@ -256,7 +257,7 @@ def _gather_tokens_kernel(
         tl.store(
             output_ptr
             + token_idx * stride_out_m
-            + block_idx * BLOCK_D
+            + base_addr
             + d_offs,
             acc.to(output_ptr.dtype.element_ty),
         )
