@@ -52,7 +52,7 @@ CORRECTNESS_CONFIGS: List[Tuple[int, int, torch.dtype, int, Optional[bool]]] = [
     (16384, HIDDEN_DIM, torch.bfloat16, 1, False),
 ]
 
-BENCH_TOKEN_NUMS = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+BENCH_TOKEN_NUMS = [16, 32, 64, 128, 256, 512, 1024, 2048, 3072, 4096, 8192, 16384]
 BENCH_HIDDEN_DIM = HIDDEN_DIM
 BENCH_DTYPE = torch.bfloat16
 BENCH_PATTERN = comm.AllReduceFusionPattern.kARResidualRMSNorm

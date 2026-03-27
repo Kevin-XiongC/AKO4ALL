@@ -1533,9 +1533,10 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
   FLASHINFER_CHECK(block_size <= 1024 && cluster_size > 0,
                    "block_size > 1024 or cluster_size <= 0");
 
-  // For twoshot with small token counts, use full grid to accelerate phases 1 & 3.
-  // Extra blocks skip phase 2 (no work) but participate in barriers.
-  int effective_cluster_num = (!oneshot && cluster_num < sm_count / cluster_size) ?
+  // For twoshot with small token counts (< 50% SM utilization), use full grid
+  // to accelerate phases 1 & 3. Extra blocks skip phase 2 but participate in barriers.
+  // Only apply when grid is significantly underutilized to avoid perturbing large-token perf.
+  int effective_cluster_num = (!oneshot && cluster_num * 2 < sm_count / cluster_size) ?
       std::max(cluster_num, params.size / params.hidden_dim) : cluster_num;
   int grid_size = (std::min(sm_count, effective_cluster_num * cluster_size) / cluster_size) * cluster_size;
   cudaLaunchConfig_t cfg;
