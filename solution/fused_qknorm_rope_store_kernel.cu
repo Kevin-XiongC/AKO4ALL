@@ -250,22 +250,29 @@ __global__ void __launch_bounds__(256, 8) fusedQKNormRopeStoreKernel(
         elements[i] = (elements[i] * cos_val + elements2[i] * sin_val) * attention_factor;
       }
     } else {
-      // NeoX style
+      // NeoX style — vectorized cos/sin cache loads
       __syncwarp();
       int const half_rotary_lanes = rotary_lanes / 2;
       unsigned int active_mask = (1u << rotary_lanes) - 1;
+
+      // For NeoX: half_dim for lane's elements are consecutive.
+      // base_half_dim = ((laneId * numElemsPerThread) * 2 % rotary_dim) / 2
+      //               = (laneId * numElemsPerThread) % half_rotary
+      int base_half = (laneId * numElemsPerThread) % half_rotary;
+
+      // Load 4 cos and 4 sin values as float4 (16 bytes each, coalesced)
+      float4 cos4 = *reinterpret_cast<float4 const*>(&cache_row[base_half]);
+      float4 sin4 = *reinterpret_cast<float4 const*>(&cache_row[half_rotary + base_half]);
+      float cos_arr[4] = {cos4.x, cos4.y, cos4.z, cos4.w};
+      float sin_arr[4] = {sin4.x, sin4.y, sin4.z, sin4.w};
+
       #pragma unroll
       for (int i = 0; i < numElemsPerThread; i++) {
         elements2[i] = __shfl_xor_sync(active_mask, elements[i], half_rotary_lanes);
         if (laneId < half_rotary_lanes) {
           elements2[i] = -elements2[i];
         }
-        int dim_idx = laneId * numElemsPerThread + i;
-        dim_idx = (dim_idx * 2) % rotary_dim;
-        int half_dim = dim_idx / 2;
-        float cos_val = cache_row[half_dim];
-        float sin_val = cache_row[half_rotary + half_dim];
-        elements[i] = (elements[i] * cos_val + elements2[i] * sin_val) * attention_factor;
+        elements[i] = (elements[i] * cos_arr[i] + elements2[i] * sin_arr[i]) * attention_factor;
       }
       __syncwarp();
     }
