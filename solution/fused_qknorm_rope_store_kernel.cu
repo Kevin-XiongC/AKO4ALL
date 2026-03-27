@@ -64,35 +64,6 @@ inline __device__ __host__ T divUp(T m, T n) {
 }  // namespace fused_helpers
 
 // ============================================================================
-// YaRN frequency computation (same as original)
-// ============================================================================
-
-__device__ inline float compute_freq_yarn(
-    float base, int head_dim, int half_dim,
-    float factor, float low, float high) {
-  float freq = powf(base, -2.0f * half_dim / static_cast<float>(head_dim));
-
-  if (factor != 1.0f) {
-    float inv_freq_extrapolation = freq;
-    float inv_freq_interpolation = freq / factor;
-
-    float high_adj = high;
-    if (fabsf(low - high_adj) <= 1e-6f) {
-      high_adj += 0.001f;
-    }
-
-    float linear_func = (static_cast<float>(half_dim) - low) / (high_adj - low);
-    float ramp_func = fminf(fmaxf(linear_func, 0.0f), 1.0f);
-    float inv_freq_extrapolation_factor = 1.0f - ramp_func;
-
-    freq = inv_freq_interpolation * (1.0f - inv_freq_extrapolation_factor) +
-           inv_freq_extrapolation * inv_freq_extrapolation_factor;
-  }
-
-  return freq;
-}
-
-// ============================================================================
 // Main fused kernel
 // ============================================================================
 
@@ -113,7 +84,7 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
     float const eps,
     __nv_bfloat16 const* __restrict__ q_weight,
     __nv_bfloat16 const* __restrict__ k_weight,
-    int const* __restrict__ position_ids,
+    int64_t const* __restrict__ position_ids,
     int const num_tokens,
     int const rotary_dim,
     __nv_bfloat16 const* __restrict__ cos_sin_cache,  // [max_pos, rotary_dim] BF16
@@ -169,16 +140,17 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
   using vec_T = typename fused_helpers::packed_as<uint, vecSize>::type;
 
   // Compute offset into qkv buffer for this (token, head)
-  int offsetWarp;
+  // Use int64_t to avoid overflow for large models (e.g. 128 heads × 256 dim × 64K tokens)
+  int64_t offsetWarp;
   if (headType == Q_HEAD) {
-    offsetWarp = tokenIdx * num_all_heads * head_dim + headIdx * head_dim;
+    offsetWarp = static_cast<int64_t>(tokenIdx) * num_all_heads * head_dim + headIdx * head_dim;
   } else if (headType == K_HEAD) {
-    offsetWarp = tokenIdx * num_all_heads * head_dim + num_heads_q * head_dim + headIdx * head_dim;
+    offsetWarp = static_cast<int64_t>(tokenIdx) * num_all_heads * head_dim + num_heads_q * head_dim + headIdx * head_dim;
   } else {  // V_HEAD
-    offsetWarp = tokenIdx * num_all_heads * head_dim +
+    offsetWarp = static_cast<int64_t>(tokenIdx) * num_all_heads * head_dim +
                  (num_heads_q + num_heads_k) * head_dim + headIdx * head_dim;
   }
-  int offsetThread = offsetWarp + laneId * numElemsPerThread;
+  int64_t offsetThread = offsetWarp + laneId * numElemsPerThread;
 
   // ---- Load from QKV buffer ----
   {
@@ -195,8 +167,8 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
   // ---- V heads: no norm/rope, just FP8 cast + store ----
   if (headType == V_HEAD) {
     int const cacheSlot = out_loc[tokenIdx];
-    int const cacheOffset = cacheSlot * kv_cache_stride + headIdx * head_dim
-                            + laneId * numElemsPerThread;
+    int64_t const cacheOffset = static_cast<int64_t>(cacheSlot) * kv_cache_stride
+                                + headIdx * head_dim + laneId * numElemsPerThread;
 
     // Pack FP8 bytes into uint32 for coalesced store
     uint32_t packed = 0;
@@ -239,22 +211,22 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
   // Determine output location
   float scale_inv;
   __nv_fp8_e4m3* out_ptr;
-  int out_offset;
+  int64_t out_offset;
   if (headType == Q_HEAD) {
     scale_inv = q_scale_inv;
     out_ptr = q_output;
-    out_offset = tokenIdx * q_output_stride + headIdx * head_dim + laneId * numElemsPerThread;
+    out_offset = static_cast<int64_t>(tokenIdx) * q_output_stride + headIdx * head_dim + laneId * numElemsPerThread;
   } else {
     scale_inv = k_scale_inv;
     out_ptr = k_cache;
     int const cacheSlot = out_loc[tokenIdx];
-    out_offset = cacheSlot * kv_cache_stride + headIdx * head_dim + laneId * numElemsPerThread;
+    out_offset = static_cast<int64_t>(cacheSlot) * kv_cache_stride + headIdx * head_dim + laneId * numElemsPerThread;
   }
 
   if (applyRotary) {
-    int const pos = position_ids[tokenIdx];
+    int64_t const pos = position_ids[tokenIdx];
     int const half_rotary = rotary_dim / 2;
-    __nv_bfloat16 const* cache_row = cos_sin_cache + pos * rotary_dim;
+    __nv_bfloat16 const* cache_row = cos_sin_cache + static_cast<int64_t>(pos) * rotary_dim;
 
     if constexpr (interleave) {
       #pragma unroll
@@ -326,7 +298,7 @@ void launchFusedQKNormRopeStore(
     int const num_heads_q, int const num_heads_k, int const num_heads_v,
     int const head_dim, float const eps,
     void const* q_weight, void const* k_weight,
-    bool const interleave, int const* position_ids,
+    bool const interleave, int64_t const* position_ids,
     int const rotary_dim, __nv_bfloat16 const* cos_sin_cache,
     void* q_output, float const q_scale_inv, int const q_output_stride,
     void* k_cache, void* v_cache, int const* out_loc,
@@ -381,7 +353,7 @@ void fused_qk_norm_rope_store(
     torch::Tensor& out_loc, double k_scale, double v_scale) {
 
   CHECK_INPUT(qkv, torch::kBFloat16);
-  CHECK_INPUT(position_ids, torch::kInt32);
+  CHECK_INPUT(position_ids, torch::kInt64);
   CHECK_INPUT(q_weight, torch::kBFloat16);
   CHECK_INPUT(k_weight, torch::kBFloat16);
   CHECK_INPUT(out_loc, torch::kInt32);
@@ -400,7 +372,7 @@ void fused_qk_norm_rope_store(
       static_cast<int>(num_heads_q), static_cast<int>(num_heads_k),
       static_cast<int>(num_heads_v), static_cast<int>(head_dim),
       static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(),
-      !is_neox, reinterpret_cast<int const*>(position_ids.data_ptr()),
+      !is_neox, reinterpret_cast<int64_t const*>(position_ids.data_ptr()),
       static_cast<int>(rotary_dim),
       reinterpret_cast<__nv_bfloat16 const*>(cos_sin_cache.data_ptr()),
       q_output.data_ptr(), static_cast<float>(1.0 / q_scale),
@@ -409,47 +381,4 @@ void fused_qk_norm_rope_store(
       reinterpret_cast<int const*>(out_loc.data_ptr()),
       static_cast<float>(1.0 / k_scale), static_cast<float>(1.0 / v_scale),
       static_cast<int>(kv_cache_stride), stream);
-}
-
-// ============================================================================
-// cos_sin_cache precompute (uses exact same powf+sincosf as original kernel)
-// ============================================================================
-
-__global__ void computeCosSinCacheKernel(
-    float* __restrict__ cache, int total_elems, int half_rd, int rotary_dim,
-    float base, float factor, float low, float high) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= total_elems) return;
-  int pos = idx / half_rd;
-  int half_dim = idx % half_rd;
-  float freq = powf(base, -2.0f * half_dim / static_cast<float>(rotary_dim));
-  if (factor != 1.0f) {
-    float interp = freq / factor;
-    float ha = high;
-    if (fabsf(low - ha) <= 1e-6f) ha += 0.001f;
-    float lf = (static_cast<float>(half_dim) - low) / (ha - low);
-    float rf = fminf(fmaxf(lf, 0.0f), 1.0f);
-    float ef = 1.0f - rf;
-    freq = interp * (1.0f - ef) + freq * ef;
-  }
-  float theta = static_cast<float>(pos) * freq;
-  float sv, cv;
-  sincosf(theta, &sv, &cv);
-  cache[pos * rotary_dim + half_dim] = cv;
-  cache[pos * rotary_dim + half_rd + half_dim] = sv;
-}
-
-void compute_cos_sin_cache(
-    torch::Tensor& cache, int64_t max_pos, int64_t rotary_dim,
-    double base, double factor, double low, double high) {
-  CHECK_INPUT(cache, torch::kFloat32);
-  auto stream = at::cuda::getCurrentCUDAStream(cache.get_device());
-  int half_rd = static_cast<int>(rotary_dim / 2);
-  int total = static_cast<int>(max_pos) * half_rd;
-  int threads = 256;
-  int blocks = (total + threads - 1) / threads;
-  computeCosSinCacheKernel<<<blocks, threads, 0, stream>>>(
-      cache.data_ptr<float>(), total, half_rd, static_cast<int>(rotary_dim),
-      static_cast<float>(base), static_cast<float>(factor),
-      static_cast<float>(low), static_cast<float>(high));
 }

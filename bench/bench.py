@@ -81,7 +81,7 @@ def make_inputs(num_tokens, device="cuda", seed=42):
     kv_dim = NUM_HEADS_K * HEAD_DIM
 
     qkv = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device=device)
-    position_ids = (torch.arange(num_tokens, device=device) + 100).to(torch.int32)
+    position_ids = (torch.arange(num_tokens, device=device) + 100).to(torch.int64)
     q_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device) * 2.0
     k_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device) * 2.0
     q_output = torch.zeros(num_tokens, q_dim, dtype=torch.uint8, device=device)
