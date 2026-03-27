@@ -105,7 +105,7 @@ __device__ inline float compute_freq_yarn(
 //   head_dim   – dimension of each head (must be multiple of 64)
 //   interleave – true for interleaved RoPE, false for NeoX style
 template <int head_dim, bool interleave>
-__global__ void fusedQKNormRopeStoreKernel(
+__global__ void __launch_bounds__(256, 8) fusedQKNormRopeStoreKernel(
     __nv_bfloat16 const* qkv,      // [num_tokens, (nq+nk+nv)*head_dim]  (read-only)
     int const num_heads_q,
     int const num_heads_k,
@@ -287,8 +287,7 @@ __global__ void fusedQKNormRopeStoreKernel(
     uint32_t packed = 0;
     #pragma unroll
     for (int i = 0; i < numElemsPerThread; i++) {
-      float val = __bfloat162float(__float2bfloat16(elements[i]));
-      __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(val * q_scale_inv);
+      __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] * q_scale_inv);
       packed |= (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8)) << (i * 8));
     }
     *reinterpret_cast<uint32_t*>(&q_output[qOutOffset]) = packed;
@@ -300,8 +299,7 @@ __global__ void fusedQKNormRopeStoreKernel(
     uint32_t packed = 0;
     #pragma unroll
     for (int i = 0; i < numElemsPerThread; i++) {
-      float val = __bfloat162float(__float2bfloat16(elements[i]));
-      __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(val * k_scale_inv);
+      __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] * k_scale_inv);
       packed |= (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8)) << (i * 8));
     }
     *reinterpret_cast<uint32_t*>(&k_cache[cacheOffset]) = packed;
