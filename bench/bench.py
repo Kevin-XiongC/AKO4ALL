@@ -8,15 +8,16 @@ Target shape: GLM4 TP8
 
 All outputs are FP8 E4M3: q_output, k_cache, v_cache.
 
+Loss = negative sum of speedup ratios across all batch sizes.
+
 Usage:
     python bench/bench.py --solution solution/kernel.py --ref input/reference.py [--verbose]
 
 Output:
     COMPILED: True/False
     CORRECT: True/False
-    RUNTIME: <ms>
-    REF_RUNTIME: <ms>
-    SPEEDUP: <x>
+    SUM_SPEEDUP: <sum of speedups across all batch sizes>
+    SPEEDUP: <mean speedup across all batch sizes>
 """
 
 import argparse
@@ -49,7 +50,6 @@ K_SCALE = 1.0
 V_SCALE = 1.0
 
 CACHE_SIZE = 32768
-PRIMARY_NUM_TOKENS = 4096
 
 NUM_CORRECT_TRIALS = 5
 NUM_PERF_TRIALS = 100
@@ -254,7 +254,8 @@ def main():
     if args.verbose:
         print(f"Target shape: head_dim={HEAD_DIM}, q={NUM_HEADS_Q}, "
               f"kv={NUM_HEADS_K}, rotary_dim={ROTARY_DIM}, NeoX={IS_NEOX}")
-        print(f"Primary batch: {PRIMARY_NUM_TOKENS} tokens")
+        print(f"Sweep: {len(PERF_SWEEP_TOKENS)} batch sizes from "
+              f"{PERF_SWEEP_TOKENS[0]} to {PERF_SWEEP_TOKENS[-1]}")
         print(f"Hardware: {torch.cuda.get_device_name()}")
         print()
 
@@ -282,42 +283,36 @@ def main():
     if args.skip_perf:
         sys.exit(0)
 
-    # ---- Performance (primary config) ----
-    if args.verbose:
-        print(f"\n--- Performance ({PRIMARY_NUM_TOKENS} tokens, "
-              f"{args.num_perf_trials} trials) ---")
-
-    sol_times = bench_kernel(sol_mod, PRIMARY_NUM_TOKENS,
-                             num_trials=args.num_perf_trials)
-    ref_times = bench_kernel(ref_mod, PRIMARY_NUM_TOKENS,
-                             num_trials=args.num_perf_trials)
-
-    sol_stats = get_stats(sol_times)
-    ref_stats = get_stats(ref_times)
-    speedup = ref_stats["mean"] / sol_stats["mean"] if sol_stats["mean"] > 0 else 0
-
-    print(f"RUNTIME: {sol_stats['mean']:.4f}")
-    print(f"REF_RUNTIME: {ref_stats['mean']:.4f}")
-    print(f"SPEEDUP: {speedup:.4f}x")
+    # ---- Performance sweep across all batch sizes ----
+    num_trials = args.num_perf_trials
 
     if args.verbose:
-        print(f"\n  Solution: {sol_stats['mean']:.4f} ms "
-              f"(std={sol_stats['std']:.4f}, min={sol_stats['min']:.4f}, "
-              f"max={sol_stats['max']:.4f})")
-        print(f"  Reference: {ref_stats['mean']:.4f} ms "
-              f"(std={ref_stats['std']:.4f}, min={ref_stats['min']:.4f}, "
-              f"max={ref_stats['max']:.4f})")
-
-        # ---- Batch-size sweep ----
-        print(f"\n--- Batch-size sweep (50 trials each) ---")
+        print(f"\n--- Batch-size sweep ({num_trials} trials each) ---")
         print(f"  {'tokens':>6s}  {'sol(ms)':>8s}  {'ref(ms)':>8s}  {'speedup':>8s}")
-        for nt in PERF_SWEEP_TOKENS:
-            st = bench_kernel(sol_mod, nt, num_trials=50, warmup=5)
-            rt = bench_kernel(ref_mod, nt, num_trials=50, warmup=5)
-            sm = statistics.mean(st)
-            rm = statistics.mean(rt)
-            sp = rm / sm if sm > 0 else 0
+
+    speedups = []
+    for nt in PERF_SWEEP_TOKENS:
+        st = bench_kernel(sol_mod, nt, num_trials=num_trials, warmup=5)
+        rt = bench_kernel(ref_mod, nt, num_trials=num_trials, warmup=5)
+        sm = statistics.mean(st)
+        rm = statistics.mean(rt)
+        sp = rm / sm if sm > 0 else 0
+        speedups.append(sp)
+
+        if args.verbose:
             print(f"  {nt:6d}  {sm:8.4f}  {rm:8.4f}  {sp:7.2f}x")
+
+    sum_speedup = sum(speedups)
+    mean_speedup = sum_speedup / len(speedups) if speedups else 0
+
+    print(f"SUM_SPEEDUP: {sum_speedup:.4f}")
+    print(f"SPEEDUP: {mean_speedup:.4f}x")
+
+    if args.verbose:
+        print(f"\n  Sum of speedups: {sum_speedup:.4f} (across {len(speedups)} batch sizes)")
+        print(f"  Mean speedup:    {mean_speedup:.4f}x")
+        print(f"  Min speedup:     {min(speedups):.4f}x (at {PERF_SWEEP_TOKENS[speedups.index(min(speedups))]} tokens)")
+        print(f"  Max speedup:     {max(speedups):.4f}x (at {PERF_SWEEP_TOKENS[speedups.index(max(speedups))]} tokens)")
 
     sys.exit(0)
 
