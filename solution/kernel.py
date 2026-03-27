@@ -21,7 +21,7 @@ void fused_qk_norm_rope_store(
     int64_t head_dim, double eps,
     torch::Tensor& q_weight, torch::Tensor& k_weight,
     bool is_neox, torch::Tensor& position_ids,
-    double attention_factor, int64_t rotary_dim,
+    int64_t rotary_dim,
     torch::Tensor& cos_sin_cache,
     torch::Tensor& q_output, double q_scale,
     torch::Tensor& k_cache, torch::Tensor& v_cache,
@@ -57,13 +57,15 @@ _cos_sin_cache = {}
 _MAX_POS = 131072
 
 
-def _get_cos_sin_cache(base, rotary_dim, factor, low, high, device):
-    """Compute cos_sin_cache using CUDA powf+sincosf for exact match."""
-    key = (base, rotary_dim, factor, low, high, device)
+def _get_cos_sin_cache(base, rotary_dim, factor, low, high, attention_factor, device):
+    """Compute cos_sin_cache using CUDA powf+sincosf, pre-baked with attention_factor."""
+    key = (base, rotary_dim, factor, low, high, attention_factor, device)
     if key not in _cos_sin_cache:
         mod = get_module()
         cache = torch.empty(_MAX_POS, rotary_dim, dtype=torch.float32, device=device)
         mod.compute_cos_sin_cache(cache, _MAX_POS, rotary_dim, base, factor, low, high)
+        if attention_factor != 1.0:
+            cache.mul_(attention_factor)
         torch.cuda.synchronize()
         _cos_sin_cache[key] = cache
     return _cos_sin_cache[key]
@@ -75,11 +77,11 @@ def fused_qk_norm_rope_store(
     factor, low, high, attention_factor, rotary_dim,
     q_output, q_scale, k_cache, v_cache, out_loc, k_scale, v_scale,
 ):
-    cos_sin_cache = _get_cos_sin_cache(base, rotary_dim, factor, low, high, qkv.device)
+    cos_sin_cache = _get_cos_sin_cache(base, rotary_dim, factor, low, high, attention_factor, qkv.device)
     mod = get_module()
     mod.fused_qk_norm_rope_store(
         qkv, num_heads_q, num_heads_k, num_heads_v, head_dim,
         eps, q_weight, k_weight, is_neox, position_ids,
-        attention_factor, rotary_dim, cos_sin_cache,
+        rotary_dim, cos_sin_cache,
         q_output, q_scale, k_cache, v_cache, out_loc, k_scale, v_scale,
     )

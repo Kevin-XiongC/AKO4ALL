@@ -115,7 +115,6 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
     __nv_bfloat16 const* __restrict__ k_weight,
     int const* __restrict__ position_ids,
     int const num_tokens,
-    float attention_factor,
     int const rotary_dim,
     float const* __restrict__ cos_sin_cache,  // [max_pos, rotary_dim] FP32
     __nv_fp8_e4m3* q_output,
@@ -264,7 +263,7 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
         int half_dim = (laneId * numElemsPerThread + i) / 2;
         float cos_val = cache_row[half_dim];
         float sin_val = cache_row[half_rotary + half_dim];
-        elements[i] = (elements[i] * cos_val + e2 * sin_val) * attention_factor;
+        elements[i] = (elements[i] * cos_val + e2 * sin_val) ;
       }
     } else {
       // NeoX style — vectorized cos/sin cache loads
@@ -284,7 +283,7 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
         if (laneId < half_rotary_lanes) {
           e2 = -e2;
         }
-        elements[i] = (elements[i] * cos_arr[i] + e2 * sin_arr[i]) * attention_factor;
+        elements[i] = (elements[i] * cos_arr[i] + e2 * sin_arr[i]) ;
       }
       __syncwarp();
     }
@@ -319,8 +318,7 @@ void launchFusedQKNormRopeStore(
     int const head_dim, float const eps,
     void const* q_weight, void const* k_weight,
     bool const interleave, int const* position_ids,
-    float attention_factor, int const rotary_dim,
-    float const* cos_sin_cache,
+    int const rotary_dim, float const* cos_sin_cache,
     void* q_output, float const q_scale_inv, int const q_output_stride,
     void* k_cache, void* v_cache, int const* out_loc,
     float const k_scale_inv, float const v_scale_inv,
@@ -339,8 +337,7 @@ void launchFusedQKNormRopeStore(
           num_heads_q, num_heads_k, num_heads_v, eps,                      \
           reinterpret_cast<__nv_bfloat16 const*>(q_weight),                \
           reinterpret_cast<__nv_bfloat16 const*>(k_weight),                \
-          position_ids, num_tokens,                                        \
-          attention_factor, rotary_dim, cos_sin_cache,                     \
+          position_ids, num_tokens, rotary_dim, cos_sin_cache,              \
           reinterpret_cast<__nv_fp8_e4m3*>(q_output),                      \
           q_scale_inv, q_output_stride,                                    \
           reinterpret_cast<__nv_fp8_e4m3*>(k_cache),                       \
@@ -368,7 +365,7 @@ void fused_qk_norm_rope_store(
     int64_t head_dim, double eps,
     torch::Tensor& q_weight, torch::Tensor& k_weight,
     bool is_neox, torch::Tensor& position_ids,
-    double attention_factor, int64_t rotary_dim,
+    int64_t rotary_dim,
     torch::Tensor& cos_sin_cache,
     torch::Tensor& q_output, double q_scale,
     torch::Tensor& k_cache, torch::Tensor& v_cache,
@@ -395,7 +392,7 @@ void fused_qk_norm_rope_store(
       static_cast<int>(num_heads_v), static_cast<int>(head_dim),
       static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(),
       !is_neox, reinterpret_cast<int const*>(position_ids.data_ptr()),
-      static_cast<float>(attention_factor), static_cast<int>(rotary_dim),
+      static_cast<int>(rotary_dim),
       reinterpret_cast<float const*>(cos_sin_cache.data_ptr()),
       q_output.data_ptr(), static_cast<float>(1.0 / q_scale),
       static_cast<int>(q_output_stride),
