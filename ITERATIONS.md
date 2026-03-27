@@ -13,6 +13,7 @@
 | 4 | cos_sin_cache (CUDA-computed) + __restrict__ | 124.32 | 3.89x | no-change |
 | 5 | Vectorized float4 cos_sin_cache loads | 144.08 | 4.50x | improved |
 | 6 | Skip sumOfSquares for V heads | 144.38 | 4.51x | no-change |
+| 7 | blockSize=128 (launch_bounds 128,16) | 145.69 | 4.55x | improved |
 
 ## Iterations
 

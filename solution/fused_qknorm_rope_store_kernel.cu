@@ -105,7 +105,7 @@ __device__ inline float compute_freq_yarn(
 //   head_dim   – dimension of each head (must be multiple of 64)
 //   interleave – true for interleaved RoPE, false for NeoX style
 template <int head_dim, bool interleave>
-__global__ void __launch_bounds__(256, 8) fusedQKNormRopeStoreKernel(
+__global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
     __nv_bfloat16 const* __restrict__ qkv,
     int const num_heads_q,
     int const num_heads_k,
@@ -334,7 +334,7 @@ void launchFusedQKNormRopeStore(
     float const k_scale_inv, float const v_scale_inv,
     int const kv_cache_stride, cudaStream_t stream) {
 
-  constexpr int blockSize = 256;
+  constexpr int blockSize = 128;
   int const warpsPerBlock = blockSize / 32;
   int const totalHeads = num_heads_q + num_heads_k + num_heads_v;
   int const totalWarps = num_tokens * totalHeads;
