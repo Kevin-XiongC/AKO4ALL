@@ -107,10 +107,31 @@ def run_kernel(mod, qkv, position_ids, q_weight, k_weight,
 # ---------------------------------------------------------------------------
 # Correctness
 # ---------------------------------------------------------------------------
+# FP8 E4M3: 3-bit mantissa → 1 ULP relative tolerance = 2^-3 = 0.125
+# Subnormal minimum step = 2^-9 ≈ 0.002
+FP8_ATOL = 0.002
+FP8_RTOL = 0.125
+
+
+def _check_fp8_close(ref_u8, sol_u8):
+    """Compare FP8 E4M3 values in float domain with 1-ULP tolerance (vLLM style).
+
+    Converting uint8 → float8_e4m3fn → float32 means ±0 both become 0.0,
+    so signed-zero differences are naturally handled.
+    """
+    ref_f = ref_u8.view(torch.float8_e4m3fn).float()
+    sol_f = sol_u8.view(torch.float8_e4m3fn).float()
+    diff = (ref_f - sol_f).abs()
+    tol = FP8_ATOL + FP8_RTOL * torch.max(ref_f.abs(), sol_f.abs())
+    ok = (diff <= tol).all().item()
+    max_diff = diff.max().item()
+    return ok, max_diff
+
+
 def check_correctness(ref_mod, sol_mod, verbose=False):
     """
     Check correctness across multiple token counts and trials.
-    Q/K/V all compared as FP8 uint8 within 1 ULP.
+    FP8 outputs compared as float values with atol/rtol (matching vLLM style).
     """
     all_pass = True
 
@@ -130,24 +151,21 @@ def check_correctness(ref_mod, sol_mod, verbose=False):
             run_kernel(sol_mod, qkv_sol, pos, qw, kw,
                        qo_sol, kc_sol, vc_sol, out_loc)
 
-            # Q output: FP8 as uint8, max diff <= 1 ULP
-            q_diff = (qo_ref.int() - qo_sol.int()).abs().max().item()
-            q_ok = q_diff <= 1
+            q_ok, q_diff = _check_fp8_close(qo_ref, qo_sol)
 
-            # K/V cache: within 1 ULP (uint8 diff <= 1)
             k_ok = True
             v_ok = True
-            k_max_diff = 0
-            v_max_diff = 0
+            k_max_diff = 0.0
+            v_max_diff = 0.0
             for i in range(num_tokens):
                 slot = out_loc[i].item()
-                kd = (kc_ref[slot].int() - kc_sol[slot].int()).abs().max().item()
-                vd = (vc_ref[slot].int() - vc_sol[slot].int()).abs().max().item()
+                ki_ok, kd = _check_fp8_close(kc_ref[slot], kc_sol[slot])
+                vi_ok, vd = _check_fp8_close(vc_ref[slot], vc_sol[slot])
                 k_max_diff = max(k_max_diff, kd)
                 v_max_diff = max(v_max_diff, vd)
-                if kd > 1:
+                if not ki_ok:
                     k_ok = False
-                if vd > 1:
+                if not vi_ok:
                     v_ok = False
 
             ok = q_ok and k_ok and v_ok
@@ -158,9 +176,9 @@ def check_correctness(ref_mod, sol_mod, verbose=False):
                 status = "PASS" if ok else "FAIL"
                 print(
                     f"  [{status}] tokens={num_tokens:4d} trial={trial} "
-                    f"Q={'ok' if q_ok else 'FAIL'}(maxdiff={q_diff}) "
-                    f"K={'ok' if k_ok else 'FAIL'}(maxdiff={k_max_diff}) "
-                    f"V={'ok' if v_ok else 'FAIL'}(maxdiff={v_max_diff})"
+                    f"Q={'ok' if q_ok else 'FAIL'}(maxdiff={q_diff:.4e}) "
+                    f"K={'ok' if k_ok else 'FAIL'}(maxdiff={k_max_diff:.4e}) "
+                    f"V={'ok' if v_ok else 'FAIL'}(maxdiff={v_max_diff:.4e})"
                 )
 
     return all_pass

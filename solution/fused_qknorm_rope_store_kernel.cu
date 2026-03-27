@@ -116,7 +116,7 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
     int const* __restrict__ position_ids,
     int const num_tokens,
     int const rotary_dim,
-    float const* __restrict__ cos_sin_cache,  // [max_pos, rotary_dim] FP32
+    __nv_bfloat16 const* __restrict__ cos_sin_cache,  // [max_pos, rotary_dim] BF16
     __nv_fp8_e4m3* q_output,
     float const q_scale_inv,
     int const q_output_stride,
@@ -254,15 +254,15 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
   if (applyRotary) {
     int const pos = position_ids[tokenIdx];
     int const half_rotary = rotary_dim / 2;
-    float const* cache_row = cos_sin_cache + pos * rotary_dim;
+    __nv_bfloat16 const* cache_row = cos_sin_cache + pos * rotary_dim;
 
     if constexpr (interleave) {
       #pragma unroll
       for (int i = 0; i < numElemsPerThread; i++) {
         float e2 = (i % 2 == 0) ? -elements[i + 1] : elements[i - 1];
         int half_dim = (laneId * numElemsPerThread + i) / 2;
-        float cos_val = cache_row[half_dim];
-        float sin_val = cache_row[half_rotary + half_dim];
+        float cos_val = __bfloat162float(cache_row[half_dim]);
+        float sin_val = __bfloat162float(cache_row[half_rotary + half_dim]);
         elements[i] = (elements[i] * cos_val + e2 * sin_val) ;
       }
     } else {
@@ -272,10 +272,19 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
       unsigned int active_mask = (1u << rotary_lanes) - 1;
       int base_half = (laneId * numElemsPerThread) % half_rotary;
 
-      float4 cos4 = *reinterpret_cast<float4 const*>(&cache_row[base_half]);
-      float4 sin4 = *reinterpret_cast<float4 const*>(&cache_row[half_rotary + base_half]);
-      float cos_arr[4] = {cos4.x, cos4.y, cos4.z, cos4.w};
-      float sin_arr[4] = {sin4.x, sin4.y, sin4.z, sin4.w};
+      // Load 4 BF16 cos values and convert to FP32
+      __nv_bfloat162 cos_p0 = *reinterpret_cast<__nv_bfloat162 const*>(&cache_row[base_half]);
+      __nv_bfloat162 cos_p1 = *reinterpret_cast<__nv_bfloat162 const*>(&cache_row[base_half + 2]);
+      float2 cf0 = __bfloat1622float2(cos_p0);
+      float2 cf1 = __bfloat1622float2(cos_p1);
+      float cos_arr[4] = {cf0.x, cf0.y, cf1.x, cf1.y};
+
+      // Load 4 BF16 sin values and convert to FP32
+      __nv_bfloat162 sin_p0 = *reinterpret_cast<__nv_bfloat162 const*>(&cache_row[half_rotary + base_half]);
+      __nv_bfloat162 sin_p1 = *reinterpret_cast<__nv_bfloat162 const*>(&cache_row[half_rotary + base_half + 2]);
+      float2 sf0 = __bfloat1622float2(sin_p0);
+      float2 sf1 = __bfloat1622float2(sin_p1);
+      float sin_arr[4] = {sf0.x, sf0.y, sf1.x, sf1.y};
 
       #pragma unroll
       for (int i = 0; i < numElemsPerThread; i++) {
@@ -318,7 +327,7 @@ void launchFusedQKNormRopeStore(
     int const head_dim, float const eps,
     void const* q_weight, void const* k_weight,
     bool const interleave, int const* position_ids,
-    int const rotary_dim, float const* cos_sin_cache,
+    int const rotary_dim, __nv_bfloat16 const* cos_sin_cache,
     void* q_output, float const q_scale_inv, int const q_output_stride,
     void* k_cache, void* v_cache, int const* out_loc,
     float const k_scale_inv, float const v_scale_inv,
@@ -376,7 +385,7 @@ void fused_qk_norm_rope_store(
   CHECK_INPUT(q_weight, torch::kBFloat16);
   CHECK_INPUT(k_weight, torch::kBFloat16);
   CHECK_INPUT(out_loc, torch::kInt32);
-  CHECK_INPUT(cos_sin_cache, torch::kFloat32);
+  CHECK_INPUT(cos_sin_cache, torch::kBFloat16);
   CHECK_TH_CUDA(q_output); CHECK_CONTIGUOUS(q_output);
   CHECK_TH_CUDA(k_cache); CHECK_CONTIGUOUS(k_cache);
   CHECK_TH_CUDA(v_cache); CHECK_CONTIGUOUS(v_cache);
@@ -393,7 +402,7 @@ void fused_qk_norm_rope_store(
       static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(),
       !is_neox, reinterpret_cast<int const*>(position_ids.data_ptr()),
       static_cast<int>(rotary_dim),
-      reinterpret_cast<float const*>(cos_sin_cache.data_ptr()),
+      reinterpret_cast<__nv_bfloat16 const*>(cos_sin_cache.data_ptr()),
       q_output.data_ptr(), static_cast<float>(1.0 / q_scale),
       static_cast<int>(q_output_stride),
       k_cache.data_ptr(), v_cache.data_ptr(),
