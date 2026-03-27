@@ -233,10 +233,24 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
     }
   }
 
-  // ---- Q and K heads: RoPE (from precomputed cos_sin_cache) ----
-  float elements2[numElemsPerThread];
+  // ---- Q and K heads: RoPE (from precomputed cos_sin_cache) + FP8 store ----
   int const rotary_lanes = rotary_dim / numElemsPerThread;
   bool const applyRotary = (laneId < rotary_lanes);
+
+  // Determine output location
+  float scale_inv;
+  __nv_fp8_e4m3* out_ptr;
+  int out_offset;
+  if (headType == Q_HEAD) {
+    scale_inv = q_scale_inv;
+    out_ptr = q_output;
+    out_offset = tokenIdx * q_output_stride + headIdx * head_dim + laneId * numElemsPerThread;
+  } else {
+    scale_inv = k_scale_inv;
+    out_ptr = k_cache;
+    int const cacheSlot = out_loc[tokenIdx];
+    out_offset = cacheSlot * kv_cache_stride + headIdx * head_dim + laneId * numElemsPerThread;
+  }
 
   if (applyRotary) {
     int const pos = position_ids[tokenIdx];
@@ -246,24 +260,19 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
     if constexpr (interleave) {
       #pragma unroll
       for (int i = 0; i < numElemsPerThread; i++) {
-        elements2[i] = (i % 2 == 0) ? -elements[i + 1] : elements[i - 1];
+        float e2 = (i % 2 == 0) ? -elements[i + 1] : elements[i - 1];
         int half_dim = (laneId * numElemsPerThread + i) / 2;
         float cos_val = cache_row[half_dim];
         float sin_val = cache_row[half_rotary + half_dim];
-        elements[i] = (elements[i] * cos_val + elements2[i] * sin_val) * attention_factor;
+        elements[i] = (elements[i] * cos_val + e2 * sin_val) * attention_factor;
       }
     } else {
       // NeoX style — vectorized cos/sin cache loads
       __syncwarp();
       int const half_rotary_lanes = rotary_lanes / 2;
       unsigned int active_mask = (1u << rotary_lanes) - 1;
-
-      // For NeoX: half_dim for lane's elements are consecutive.
-      // base_half_dim = ((laneId * numElemsPerThread) * 2 % rotary_dim) / 2
-      //               = (laneId * numElemsPerThread) % half_rotary
       int base_half = (laneId * numElemsPerThread) % half_rotary;
 
-      // Load 4 cos and 4 sin values as float4 (16 bytes each, coalesced)
       float4 cos4 = *reinterpret_cast<float4 const*>(&cache_row[base_half]);
       float4 sin4 = *reinterpret_cast<float4 const*>(&cache_row[half_rotary + base_half]);
       float cos_arr[4] = {cos4.x, cos4.y, cos4.z, cos4.w};
@@ -271,41 +280,24 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
 
       #pragma unroll
       for (int i = 0; i < numElemsPerThread; i++) {
-        elements2[i] = __shfl_xor_sync(active_mask, elements[i], half_rotary_lanes);
+        float e2 = __shfl_xor_sync(active_mask, elements[i], half_rotary_lanes);
         if (laneId < half_rotary_lanes) {
-          elements2[i] = -elements2[i];
+          e2 = -e2;
         }
-        elements[i] = (elements[i] * cos_arr[i] + elements2[i] * sin_arr[i]) * attention_factor;
+        elements[i] = (elements[i] * cos_arr[i] + e2 * sin_arr[i]) * attention_factor;
       }
       __syncwarp();
     }
   }
 
-  // ---- Store results (vectorized uint32 writes) ----
-  if (headType == Q_HEAD) {
-    int const qOutOffset = tokenIdx * q_output_stride + headIdx * head_dim
-                            + laneId * numElemsPerThread;
-
-    uint32_t packed = 0;
-    #pragma unroll
-    for (int i = 0; i < numElemsPerThread; i++) {
-      __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] * q_scale_inv);
-      packed |= (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8)) << (i * 8));
-    }
-    *reinterpret_cast<uint32_t*>(&q_output[qOutOffset]) = packed;
-  } else {
-    int const cacheSlot = out_loc[tokenIdx];
-    int const cacheOffset = cacheSlot * kv_cache_stride + headIdx * head_dim
-                            + laneId * numElemsPerThread;
-
-    uint32_t packed = 0;
-    #pragma unroll
-    for (int i = 0; i < numElemsPerThread; i++) {
-      __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] * k_scale_inv);
-      packed |= (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8)) << (i * 8));
-    }
-    *reinterpret_cast<uint32_t*>(&k_cache[cacheOffset]) = packed;
+  // Vectorized uint32 FP8 store
+  uint32_t packed = 0;
+  #pragma unroll
+  for (int i = 0; i < numElemsPerThread; i++) {
+    __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] * scale_inv);
+    packed |= (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8)) << (i * 8));
   }
+  *reinterpret_cast<uint32_t*>(&out_ptr[out_offset]) = packed;
 }
 
 // ============================================================================

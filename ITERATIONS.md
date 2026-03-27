@@ -14,6 +14,7 @@
 | 5 | Vectorized float4 cos_sin_cache loads | 144.08 | 4.50x | improved |
 | 6 | Skip sumOfSquares for V heads | 144.38 | 4.51x | no-change |
 | 7 | blockSize=128 (launch_bounds 128,16) | 145.69 | 4.55x | improved |
+| 8 | Unified Q/K output path + eliminated elements2 array | 146.47 | 4.58x | improved |
 
 ## Iterations
 
