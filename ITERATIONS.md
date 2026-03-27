@@ -19,6 +19,7 @@
 | 9b | Skip attn_factor only (no hybrid) | 144.83 | 4.53x | regression |
 | 10 | Pre-bake attention_factor into cos_sin_cache | 148.84 | 4.65x | improved |
 | 11 | blockSize=64 | 139.17 | 4.35x | regression |
+| 12 | Interleaved cos_sin_cache layout | 148.07 | 4.63x | no-change |
 
 ## Iterations
 
