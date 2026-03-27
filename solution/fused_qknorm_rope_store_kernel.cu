@@ -207,12 +207,14 @@ __global__ void fusedQKNormRopeStoreKernel(
     int const cacheOffset = cacheSlot * kv_cache_stride + headIdx * head_dim
                             + laneId * numElemsPerThread;
 
+    // Pack FP8 bytes into uint32 for coalesced store
+    uint32_t packed = 0;
+    #pragma unroll
     for (int i = 0; i < numElemsPerThread; i++) {
-      // V values are already in BF16 precision (loaded from QKV buffer),
-      // so the float→BF16 round-trip is identity here. Just scale and cast.
-      float val = elements[i] * v_scale_inv;
-      v_cache[cacheOffset + i] = __nv_fp8_e4m3(val);
+      __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] * v_scale_inv);
+      packed |= (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8)) << (i * 8));
     }
+    *reinterpret_cast<uint32_t*>(&v_cache[cacheOffset]) = packed;
     return;
   }
 
@@ -220,12 +222,18 @@ __global__ void fusedQKNormRopeStoreKernel(
   sumOfSquares = fused_helpers::warpReduceSum(sumOfSquares);
   float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
 
+  // Vectorized weight load
   bool const isQ = (headType == Q_HEAD);
-  for (int i = 0; i < numElemsPerThread; i++) {
-    int dim = laneId * numElemsPerThread + i;
-    float weight = isQ ? __bfloat162float(q_weight[dim])
-                       : __bfloat162float(k_weight[dim]);
-    elements[i] *= rms_rcp * weight;
+  {
+    __nv_bfloat16 const* wptr = isQ ? q_weight : k_weight;
+    vec_T wvec = *reinterpret_cast<vec_T const*>(&wptr[laneId * numElemsPerThread]);
+    #pragma unroll
+    for (int i = 0; i < vecSize; i++) {
+      float2 wvals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(
+          reinterpret_cast<uint const*>(&wvec) + i));
+      elements[2 * i] *= rms_rcp * wvals.x;
+      elements[2 * i + 1] *= rms_rcp * wvals.y;
+    }
   }
 
   // ---- Q and K heads: RoPE ----
@@ -271,31 +279,32 @@ __global__ void fusedQKNormRopeStoreKernel(
     }
   }
 
-  // ---- Store results ----
+  // ---- Store results (vectorized uint32 writes) ----
   if (headType == Q_HEAD) {
-    // Q: round to BF16 precision, then cast to FP8 E4M3 and write to q_output
     int const qOutOffset = tokenIdx * q_output_stride + headIdx * head_dim
                             + laneId * numElemsPerThread;
 
+    uint32_t packed = 0;
+    #pragma unroll
     for (int i = 0; i < numElemsPerThread; i++) {
       float val = __bfloat162float(__float2bfloat16(elements[i]));
-      val *= q_scale_inv;
-      q_output[qOutOffset + i] = __nv_fp8_e4m3(val);
+      __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(val * q_scale_inv);
+      packed |= (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8)) << (i * 8));
     }
+    *reinterpret_cast<uint32_t*>(&q_output[qOutOffset]) = packed;
   } else {
-    // K: cast to FP8 E4M3 and scatter-write to k_cache
-    // Round through BF16 first to match unfused path precision
-    // (unfused path writes BF16 to QKV buffer, then reads back for FP8 cast)
     int const cacheSlot = out_loc[tokenIdx];
     int const cacheOffset = cacheSlot * kv_cache_stride + headIdx * head_dim
                             + laneId * numElemsPerThread;
 
+    uint32_t packed = 0;
+    #pragma unroll
     for (int i = 0; i < numElemsPerThread; i++) {
-      // Round to BF16 precision (match unfused path where K is written as BF16 then re-read)
       float val = __bfloat162float(__float2bfloat16(elements[i]));
-      val *= k_scale_inv;
-      k_cache[cacheOffset + i] = __nv_fp8_e4m3(val);
+      __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(val * k_scale_inv);
+      packed |= (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8)) << (i * 8));
     }
+    *reinterpret_cast<uint32_t*>(&k_cache[cacheOffset]) = packed;
   }
 }
 

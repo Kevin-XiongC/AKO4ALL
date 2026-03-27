@@ -4,8 +4,10 @@
 
 <!-- Append one row per iteration. Status: improved / no-change / regression / failed -->
 
-| Iter | Title | Speedup(mean) | Runtime(mean) | Status |
-|------|-------|---------|--------------|--------|
+| Iter | Title | SUM_SPEEDUP | Mean Speedup | Status |
+|------|-------|-------------|--------------|--------|
+| 0 | Baseline | 118.76 | 3.71x | baseline |
+| 1 | Vectorized uint32 FP8 stores + vec weight loads | 120.39 | 3.76x | improved |
 
 ## Iterations
 
