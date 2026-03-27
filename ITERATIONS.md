@@ -15,6 +15,8 @@
 | 6 | Skip sumOfSquares for V heads | 144.38 | 4.51x | no-change |
 | 7 | blockSize=128 (launch_bounds 128,16) | 145.69 | 4.55x | improved |
 | 8 | Unified Q/K output path + eliminated elements2 array | 146.47 | 4.58x | improved |
+| 9 | Hybrid inline/cache + skip attn_factor | 142.56 | 4.46x | regression |
+| 9b | Skip attn_factor only (no hybrid) | 144.83 | 4.53x | regression |
 
 ## Iterations
 
