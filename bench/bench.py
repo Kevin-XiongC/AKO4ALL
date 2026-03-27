@@ -48,15 +48,15 @@ Q_SCALE = 1.0
 K_SCALE = 1.0
 V_SCALE = 1.0
 
-CACHE_SIZE = 4096
-PRIMARY_NUM_TOKENS = 32  # typical decode batch
+CACHE_SIZE = 32768
+PRIMARY_NUM_TOKENS = 4096
 
 NUM_CORRECT_TRIALS = 5
 NUM_PERF_TRIALS = 100
 NUM_WARMUP = 10
 
-CORRECTNESS_TOKEN_CONFIGS = [1, 4, 32, 128, 256, 512]
-PERF_SWEEP_TOKENS = [1, 4, 32, 128, 256, 512]
+CORRECTNESS_TOKEN_CONFIGS = [1, 128, 1024, 4096, 16384]
+PERF_SWEEP_TOKENS = list(range(128, 16384 + 1, 512))
 
 
 # ---------------------------------------------------------------------------
