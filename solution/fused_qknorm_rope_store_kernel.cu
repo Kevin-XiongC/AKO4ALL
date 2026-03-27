@@ -182,14 +182,12 @@ __global__ void __launch_bounds__(256, 8) fusedQKNormRopeStoreKernel(
   int offsetThread = offsetWarp + laneId * numElemsPerThread;
 
   // ---- Load from QKV buffer ----
-  float sumOfSquares = 0.0f;
   {
     vec_T vec = *reinterpret_cast<vec_T const*>(&qkv[offsetThread]);
+    #pragma unroll
     for (int i = 0; i < vecSize; i++) {
       float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(
           reinterpret_cast<uint*>(&vec) + i));
-      sumOfSquares += vals.x * vals.x;
-      sumOfSquares += vals.y * vals.y;
       elements[2 * i] = vals.x;
       elements[2 * i + 1] = vals.y;
     }
@@ -213,6 +211,11 @@ __global__ void __launch_bounds__(256, 8) fusedQKNormRopeStoreKernel(
   }
 
   // ---- Q and K heads: RMSNorm ----
+  float sumOfSquares = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < numElemsPerThread; i++) {
+    sumOfSquares += elements[i] * elements[i];
+  }
   sumOfSquares = fused_helpers::warpReduceSum(sumOfSquares);
   float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
 
