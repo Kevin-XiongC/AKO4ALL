@@ -45,9 +45,9 @@ FACTOR = 1.0
 LOW = 0.0
 HIGH = 0.0
 ATTENTION_FACTOR = 1.0
-Q_SCALE = 1.0
-K_SCALE = 1.0
-V_SCALE = 1.0
+Q_SCALE = None  # created per-call on the right device
+K_SCALE = None
+V_SCALE = None
 
 CACHE_SIZE = 32768
 
@@ -88,19 +88,22 @@ def make_inputs(num_tokens, device="cuda", seed=42):
     k_cache = torch.zeros(CACHE_SIZE, kv_dim, dtype=torch.uint8, device=device)
     v_cache = torch.zeros(CACHE_SIZE, kv_dim, dtype=torch.uint8, device=device)
     out_loc = torch.randperm(CACHE_SIZE, device=device)[:num_tokens].to(torch.int32)
+    q_scale = torch.ones(1, dtype=torch.float32, device=device)
+    k_scale = torch.ones(1, dtype=torch.float32, device=device)
+    v_scale = torch.ones(1, dtype=torch.float32, device=device)
 
-    return qkv, position_ids, q_weight, k_weight, q_output, k_cache, v_cache, out_loc
+    return qkv, position_ids, q_weight, k_weight, q_output, k_cache, v_cache, out_loc, q_scale, k_scale, v_scale
 
 
 def run_kernel(mod, qkv, position_ids, q_weight, k_weight,
-               q_output, k_cache, v_cache, out_loc):
+               q_output, k_cache, v_cache, out_loc, q_scale, k_scale, v_scale):
     """Call the kernel module's fused_qk_norm_rope_store function."""
     mod.fused_qk_norm_rope_store(
         qkv, NUM_HEADS_Q, NUM_HEADS_K, NUM_HEADS_V, HEAD_DIM,
         EPS, q_weight, k_weight, BASE, IS_NEOX, position_ids,
         FACTOR, LOW, HIGH, ATTENTION_FACTOR, ROTARY_DIM,
-        q_output, Q_SCALE,
-        k_cache, v_cache, out_loc, K_SCALE, V_SCALE,
+        q_output, q_scale,
+        k_cache, v_cache, out_loc, k_scale, v_scale,
     )
 
 
@@ -139,17 +142,17 @@ def check_correctness(ref_mod, sol_mod, verbose=False):
         for trial in range(NUM_CORRECT_TRIALS):
             seed = 42 + trial * 1000 + num_tokens
 
-            (qkv_ref, pos, qw, kw, qo_ref, kc_ref, vc_ref, out_loc
-             ) = make_inputs(num_tokens, seed=seed)
+            (qkv_ref, pos, qw, kw, qo_ref, kc_ref, vc_ref, out_loc,
+             qs, ks, vs) = make_inputs(num_tokens, seed=seed)
             qkv_sol = qkv_ref.clone()
             qo_sol = qo_ref.clone()
             kc_sol = kc_ref.clone()
             vc_sol = vc_ref.clone()
 
             run_kernel(ref_mod, qkv_ref, pos, qw, kw,
-                       qo_ref, kc_ref, vc_ref, out_loc)
+                       qo_ref, kc_ref, vc_ref, out_loc, qs, ks, vs)
             run_kernel(sol_mod, qkv_sol, pos, qw, kw,
-                       qo_sol, kc_sol, vc_sol, out_loc)
+                       qo_sol, kc_sol, vc_sol, out_loc, qs, ks, vs)
 
             q_ok, q_diff = _check_fp8_close(qo_ref, qo_sol)
 
@@ -207,7 +210,7 @@ def bench_kernel(mod, num_tokens, num_trials=NUM_PERF_TRIALS,
     kv_dim = NUM_HEADS_K * HEAD_DIM
 
     # Pre-create base inputs (cloned per trial for in-place safety)
-    qkv_base, pos, qw, kw, _, _, _, out_loc = make_inputs(num_tokens, seed=42)
+    qkv_base, pos, qw, kw, _, _, _, out_loc, qs, ks, vs = make_inputs(num_tokens, seed=42)
 
     # Warmup
     for _ in range(warmup):
@@ -215,7 +218,7 @@ def bench_kernel(mod, num_tokens, num_trials=NUM_PERF_TRIALS,
         qo = torch.zeros(num_tokens, q_dim, dtype=torch.uint8, device=device)
         kc = torch.zeros(CACHE_SIZE, kv_dim, dtype=torch.uint8, device=device)
         vc = torch.zeros(CACHE_SIZE, kv_dim, dtype=torch.uint8, device=device)
-        run_kernel(mod, qkv, pos, qw, kw, qo, kc, vc, out_loc)
+        run_kernel(mod, qkv, pos, qw, kw, qo, kc, vc, out_loc, qs, ks, vs)
     torch.cuda.synchronize()
 
     # Timed trials
@@ -233,7 +236,7 @@ def bench_kernel(mod, num_tokens, num_trials=NUM_PERF_TRIALS,
         end = torch.cuda.Event(enable_timing=True)
 
         start.record()
-        run_kernel(mod, qkv, pos, qw, kw, qo, kc, vc, out_loc)
+        run_kernel(mod, qkv, pos, qw, kw, qo, kc, vc, out_loc, qs, ks, vs)
         end.record()
 
         torch.cuda.synchronize()

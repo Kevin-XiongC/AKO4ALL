@@ -61,8 +61,15 @@ def fused_qk_norm_rope_store(
     qkv, num_heads_q, num_heads_k, num_heads_v, head_dim, eps,
     q_weight, k_weight, base, is_neox, position_ids,
     factor, low, high, attention_factor, rotary_dim,
-    q_output, q_scale, k_cache, v_cache, out_loc, k_scale, v_scale,
+    q_output, q_scale=None, k_cache=None, v_cache=None, out_loc=None,
+    k_scale=None, v_scale=None,
 ):
+    if q_scale is None:
+        q_scale = torch.ones(1, dtype=torch.float32, device=qkv.device)
+    if k_scale is None:
+        k_scale = torch.ones(1, dtype=torch.float32, device=qkv.device)
+    if v_scale is None:
+        v_scale = torch.ones(1, dtype=torch.float32, device=qkv.device)
     num_tokens = qkv.shape[0]
     q_size = num_heads_q * head_dim
     kv_size = num_heads_k * head_dim

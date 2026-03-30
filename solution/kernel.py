@@ -23,9 +23,9 @@ void fused_qk_norm_rope_store(
     bool is_neox, torch::Tensor& position_ids,
     int64_t rotary_dim,
     torch::Tensor& cos_sin_cache,
-    torch::Tensor& q_output, double q_scale,
+    torch::Tensor& q_output, torch::Tensor& q_scale,
     torch::Tensor& k_cache, torch::Tensor& v_cache,
-    torch::Tensor& out_loc, double k_scale, double v_scale);
+    torch::Tensor& out_loc, torch::Tensor& k_scale, torch::Tensor& v_scale);
 
 """
 
@@ -85,8 +85,13 @@ def fused_qk_norm_rope_store(
     qkv, num_heads_q, num_heads_k, num_heads_v, head_dim, eps,
     q_weight, k_weight, base, is_neox, position_ids,
     factor, low, high, attention_factor, rotary_dim,
-    q_output, q_scale, k_cache, v_cache, out_loc, k_scale, v_scale,
+    q_output, q_scale=None, k_cache=None, v_cache=None, out_loc=None,
+    k_scale=None, v_scale=None,
 ):
+    _default = lambda s: s if s is not None else torch.ones(1, dtype=torch.float32, device=qkv.device)
+    q_scale = _default(q_scale)
+    k_scale = _default(k_scale)
+    v_scale = _default(v_scale)
     cos_sin_cache = _get_cos_sin_cache(base, rotary_dim, factor, low, high, attention_factor, qkv.device)
     mod = get_module()
     mod.fused_qk_norm_rope_store(

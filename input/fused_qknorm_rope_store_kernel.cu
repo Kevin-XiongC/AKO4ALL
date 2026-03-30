@@ -124,14 +124,14 @@ __global__ void fusedQKNormRopeStoreKernel(
     int const rotary_dim,
     // Q output parameters
     __nv_fp8_e4m3* q_output,        // [num_tokens, num_heads_q * head_dim]  (FP8 bytes)
-    float const q_scale_inv,        // 1.0 / q_scale  (pre-inverted for multiply)
+    float const* __restrict__ q_scale_ptr,  // [1] per-tensor scale
     int const q_output_stride,      // num_heads_q * head_dim
     // KV cache store parameters
     __nv_fp8_e4m3* k_cache,         // [max_tokens, num_kv_heads * head_dim]  (as FP8 bytes)
     __nv_fp8_e4m3* v_cache,         // [max_tokens, num_kv_heads * head_dim]  (as FP8 bytes)
     int const* out_loc,             // [num_tokens]  – cache slot index per token
-    float const k_scale_inv,        // 1.0 / k_scale  (pre-inverted for multiply)
-    float const v_scale_inv,        // 1.0 / v_scale
+    float const* __restrict__ k_scale_ptr,  // [1] per-tensor scale
+    float const* __restrict__ v_scale_ptr,  // [1] per-tensor scale
     int const kv_cache_stride       // num_kv_heads * head_dim  (elements per cache row)
 ) {
   int const warpsPerBlock = blockDim.x / 32;
@@ -210,7 +210,7 @@ __global__ void fusedQKNormRopeStoreKernel(
     for (int i = 0; i < numElemsPerThread; i++) {
       // V values are already in BF16 precision (loaded from QKV buffer),
       // so the float→BF16 round-trip is identity here. Just scale and cast.
-      float val = elements[i] * v_scale_inv;
+      float val = elements[i] / *v_scale_ptr;
       v_cache[cacheOffset + i] = __nv_fp8_e4m3(val);
     }
     return;
@@ -279,7 +279,7 @@ __global__ void fusedQKNormRopeStoreKernel(
 
     for (int i = 0; i < numElemsPerThread; i++) {
       float val = __bfloat162float(__float2bfloat16(elements[i]));
-      val *= q_scale_inv;
+      val /= *q_scale_ptr;
       q_output[qOutOffset + i] = __nv_fp8_e4m3(val);
     }
   } else {
@@ -293,7 +293,7 @@ __global__ void fusedQKNormRopeStoreKernel(
     for (int i = 0; i < numElemsPerThread; i++) {
       // Round to BF16 precision (match unfused path where K is written as BF16 then re-read)
       float val = __bfloat162float(__float2bfloat16(elements[i]));
-      val *= k_scale_inv;
+      val /= *k_scale_ptr;
       k_cache[cacheOffset + i] = __nv_fp8_e4m3(val);
     }
   }
@@ -332,14 +332,14 @@ void launchFusedQKNormRopeStore(
     int const rotary_dim,
     // Q output parameters
     void* q_output,
-    float const q_scale_inv,
+    float const* q_scale,
     int const q_output_stride,
     // KV cache store parameters
     void* k_cache,
     void* v_cache,
     int const* out_loc,
-    float const k_scale_inv,
-    float const v_scale_inv,
+    float const* k_scale,
+    float const* v_scale,
     int const kv_cache_stride,
     cudaStream_t stream) {
 
@@ -362,10 +362,10 @@ void launchFusedQKNormRopeStore(
           base, position_ids, num_tokens,                                  \
           factor, low, high, attention_factor, rotary_dim,                 \
           reinterpret_cast<__nv_fp8_e4m3*>(q_output),                      \
-          q_scale_inv, q_output_stride,                                    \
+          q_scale, q_output_stride,                                        \
           reinterpret_cast<__nv_fp8_e4m3*>(k_cache),                       \
           reinterpret_cast<__nv_fp8_e4m3*>(v_cache),                       \
-          out_loc, k_scale_inv, v_scale_inv, kv_cache_stride);             \
+          out_loc, k_scale, v_scale, kv_cache_stride);                     \
     });
 
   switch (head_dim) {
@@ -401,13 +401,13 @@ void fused_qk_norm_rope_store(
     int64_t rotary_dim,
     // Q output
     torch::Tensor& q_output,      // [num_tokens, num_heads_q * head_dim]  UINT8 (FP8 E4M3)
-    double q_scale,
+    torch::Tensor& q_scale,       // [1] float32 per-tensor scale
     // KV cache parameters
     torch::Tensor& k_cache,       // [max_tokens, num_kv_heads * head_dim]  UINT8 (FP8 E4M3 bitcast)
     torch::Tensor& v_cache,       // [max_tokens, num_kv_heads * head_dim]  UINT8
     torch::Tensor& out_loc,       // [num_tokens]  INT32
-    double k_scale,
-    double v_scale) {
+    torch::Tensor& k_scale,       // [1] float32 per-tensor scale
+    torch::Tensor& v_scale) {     // [1] float32 per-tensor scale
 
   // Input validation
   TORCH_CHECK(qkv.dim() == 2, "QKV must be 2D");
@@ -430,6 +430,13 @@ void fused_qk_norm_rope_store(
   CHECK_TH_CUDA(v_cache);
   CHECK_CONTIGUOUS(v_cache);
 
+  TORCH_CHECK(q_scale.numel() == 1, "q_scale must be a single-element tensor");
+  TORCH_CHECK(k_scale.numel() == 1, "k_scale must be a single-element tensor");
+  TORCH_CHECK(v_scale.numel() == 1, "v_scale must be a single-element tensor");
+  CHECK_INPUT(q_scale, torch::kFloat32);
+  CHECK_INPUT(k_scale, torch::kFloat32);
+  CHECK_INPUT(v_scale, torch::kFloat32);
+
   int64_t num_tokens = qkv.size(0);
   TORCH_CHECK(position_ids.size(0) == num_tokens);
   TORCH_CHECK(out_loc.size(0) == num_tokens);
@@ -444,10 +451,6 @@ void fused_qk_norm_rope_store(
   int64_t kv_cache_stride = num_heads_k * head_dim;
   TORCH_CHECK(k_cache.size(1) == kv_cache_stride, "k_cache width must be num_kv_heads * head_dim");
   TORCH_CHECK(v_cache.size(1) == kv_cache_stride, "v_cache width must be num_kv_heads * head_dim");
-
-  TORCH_CHECK(q_scale > 0, "q_scale must be positive");
-  TORCH_CHECK(k_scale > 0, "k_scale must be positive");
-  TORCH_CHECK(v_scale > 0, "v_scale must be positive");
 
   auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
 
@@ -470,13 +473,13 @@ void fused_qk_norm_rope_store(
       static_cast<float>(attention_factor),
       static_cast<int>(rotary_dim),
       q_output.data_ptr(),
-      static_cast<float>(1.0 / q_scale),
+      reinterpret_cast<float const*>(q_scale.data_ptr()),
       static_cast<int>(q_output_stride),
       k_cache.data_ptr(),
       v_cache.data_ptr(),
       reinterpret_cast<int const*>(out_loc.data_ptr()),
-      static_cast<float>(1.0 / k_scale),
-      static_cast<float>(1.0 / v_scale),
+      reinterpret_cast<float const*>(k_scale.data_ptr()),
+      reinterpret_cast<float const*>(v_scale.data_ptr()),
       static_cast<int>(kv_cache_stride),
       stream);
 }

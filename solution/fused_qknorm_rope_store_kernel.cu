@@ -89,13 +89,13 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
     int const rotary_dim,
     __nv_bfloat16 const* __restrict__ cos_sin_cache,  // [max_pos, rotary_dim] BF16
     __nv_fp8_e4m3* q_output,
-    float const q_scale_inv,
+    float const* __restrict__ q_scale_ptr,
     int const q_output_stride,
     __nv_fp8_e4m3* k_cache,
     __nv_fp8_e4m3* v_cache,
     int const* __restrict__ out_loc,
-    float const k_scale_inv,
-    float const v_scale_inv,
+    float const* __restrict__ k_scale_ptr,
+    float const* __restrict__ v_scale_ptr,
     int const kv_cache_stride
 ) {
   int const warpsPerBlock = blockDim.x / 32;
@@ -174,7 +174,7 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
     uint32_t packed = 0;
     #pragma unroll
     for (int i = 0; i < numElemsPerThread; i++) {
-      __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] * v_scale_inv);
+      __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] / *v_scale_ptr);
       packed |= (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8)) << (i * 8));
     }
     *reinterpret_cast<uint32_t*>(&v_cache[cacheOffset]) = packed;
@@ -209,15 +209,15 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
   bool const applyRotary = (laneId < rotary_lanes);
 
   // Determine output location
-  float scale_inv;
+  float const* scale_ptr;
   __nv_fp8_e4m3* out_ptr;
   int64_t out_offset;
   if (headType == Q_HEAD) {
-    scale_inv = q_scale_inv;
+    scale_ptr = q_scale_ptr;
     out_ptr = q_output;
     out_offset = static_cast<int64_t>(tokenIdx) * q_output_stride + headIdx * head_dim + laneId * numElemsPerThread;
   } else {
-    scale_inv = k_scale_inv;
+    scale_ptr = k_scale_ptr;
     out_ptr = k_cache;
     int const cacheSlot = out_loc[tokenIdx];
     out_offset = static_cast<int64_t>(cacheSlot) * kv_cache_stride + headIdx * head_dim + laneId * numElemsPerThread;
@@ -274,7 +274,7 @@ __global__ void __launch_bounds__(128, 16) fusedQKNormRopeStoreKernel(
   uint32_t packed = 0;
   #pragma unroll
   for (int i = 0; i < numElemsPerThread; i++) {
-    __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] * scale_inv);
+    __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] / *scale_ptr);
     packed |= (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8)) << (i * 8));
   }
   *reinterpret_cast<uint32_t*>(&out_ptr[out_offset]) = packed;
@@ -300,9 +300,9 @@ void launchFusedQKNormRopeStore(
     void const* q_weight, void const* k_weight,
     bool const interleave, int64_t const* position_ids,
     int const rotary_dim, __nv_bfloat16 const* cos_sin_cache,
-    void* q_output, float const q_scale_inv, int const q_output_stride,
+    void* q_output, float const* q_scale, int const q_output_stride,
     void* k_cache, void* v_cache, int const* out_loc,
-    float const k_scale_inv, float const v_scale_inv,
+    float const* k_scale, float const* v_scale,
     int const kv_cache_stride, cudaStream_t stream) {
 
   constexpr int blockSize = 128;
@@ -320,10 +320,10 @@ void launchFusedQKNormRopeStore(
           reinterpret_cast<__nv_bfloat16 const*>(k_weight),                \
           position_ids, num_tokens, rotary_dim, cos_sin_cache,              \
           reinterpret_cast<__nv_fp8_e4m3*>(q_output),                      \
-          q_scale_inv, q_output_stride,                                    \
+          q_scale, q_output_stride,                                        \
           reinterpret_cast<__nv_fp8_e4m3*>(k_cache),                       \
           reinterpret_cast<__nv_fp8_e4m3*>(v_cache),                       \
-          out_loc, k_scale_inv, v_scale_inv, kv_cache_stride);             \
+          out_loc, k_scale, v_scale, kv_cache_stride);                     \
     });
 
   switch (head_dim) {
@@ -348,9 +348,9 @@ void fused_qk_norm_rope_store(
     bool is_neox, torch::Tensor& position_ids,
     int64_t rotary_dim,
     torch::Tensor& cos_sin_cache,
-    torch::Tensor& q_output, double q_scale,
+    torch::Tensor& q_output, torch::Tensor& q_scale,
     torch::Tensor& k_cache, torch::Tensor& v_cache,
-    torch::Tensor& out_loc, double k_scale, double v_scale) {
+    torch::Tensor& out_loc, torch::Tensor& k_scale, torch::Tensor& v_scale) {
 
   CHECK_INPUT(qkv, torch::kBFloat16);
   CHECK_INPUT(position_ids, torch::kInt64);
@@ -361,6 +361,13 @@ void fused_qk_norm_rope_store(
   CHECK_TH_CUDA(q_output); CHECK_CONTIGUOUS(q_output);
   CHECK_TH_CUDA(k_cache); CHECK_CONTIGUOUS(k_cache);
   CHECK_TH_CUDA(v_cache); CHECK_CONTIGUOUS(v_cache);
+
+  TORCH_CHECK(q_scale.numel() == 1, "q_scale must be a single-element tensor");
+  TORCH_CHECK(k_scale.numel() == 1, "k_scale must be a single-element tensor");
+  TORCH_CHECK(v_scale.numel() == 1, "v_scale must be a single-element tensor");
+  CHECK_INPUT(q_scale, torch::kFloat32);
+  CHECK_INPUT(k_scale, torch::kFloat32);
+  CHECK_INPUT(v_scale, torch::kFloat32);
 
   int64_t num_tokens = qkv.size(0);
   int64_t q_output_stride = num_heads_q * head_dim;
@@ -375,10 +382,12 @@ void fused_qk_norm_rope_store(
       !is_neox, reinterpret_cast<int64_t const*>(position_ids.data_ptr()),
       static_cast<int>(rotary_dim),
       reinterpret_cast<__nv_bfloat16 const*>(cos_sin_cache.data_ptr()),
-      q_output.data_ptr(), static_cast<float>(1.0 / q_scale),
+      q_output.data_ptr(),
+      reinterpret_cast<float const*>(q_scale.data_ptr()),
       static_cast<int>(q_output_stride),
       k_cache.data_ptr(), v_cache.data_ptr(),
       reinterpret_cast<int const*>(out_loc.data_ptr()),
-      static_cast<float>(1.0 / k_scale), static_cast<float>(1.0 / v_scale),
+      reinterpret_cast<float const*>(k_scale.data_ptr()),
+      reinterpret_cast<float const*>(v_scale.data_ptr()),
       static_cast<int>(kv_cache_stride), stream);
 }

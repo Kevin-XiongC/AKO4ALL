@@ -32,11 +32,13 @@ void fused_qk_norm_rope_store(
     double high,
     double attention_factor,
     int64_t rotary_dim,
+    torch::Tensor& q_output,
+    torch::Tensor& q_scale,
     torch::Tensor& k_cache,
     torch::Tensor& v_cache,
     torch::Tensor& out_loc,
-    double k_scale,
-    double v_scale);
+    torch::Tensor& k_scale,
+    torch::Tensor& v_scale);
 """
 
     module = load_inline(
@@ -75,38 +77,33 @@ def fused_qk_norm_rope_store(
     high: float,
     attention_factor: float,
     rotary_dim: int,
-    k_cache: torch.Tensor,      # [max_tokens, num_kv_heads * head_dim]  UINT8
-    v_cache: torch.Tensor,      # [max_tokens, num_kv_heads * head_dim]  UINT8
-    out_loc: torch.Tensor,      # [num_tokens]  INT32
-    k_scale: float = 1.0,
-    v_scale: float = 1.0,
+    q_output: torch.Tensor,     # [num_tokens, num_heads_q * head_dim]  UINT8
+    q_scale: torch.Tensor = None,  # [1] float32
+    k_cache: torch.Tensor = None,
+    v_cache: torch.Tensor = None,
+    out_loc: torch.Tensor = None,
+    k_scale: torch.Tensor = None,  # [1] float32
+    v_scale: torch.Tensor = None,  # [1] float32
 ):
     """
     Fused QK-Norm + RoPE + FP8-Cast + KV-Store.
 
-    Operates in-place:
-      - Q portion of qkv is updated with norm+rope result (BF16)
-      - K/V are written as FP8 E4M3 directly to k_cache/v_cache at out_loc positions
+    Outputs:
+      - q_output: [num_tokens, num_heads_q * head_dim] uint8 (FP8 E4M3)
+      - k_cache:  scatter-written at out_loc positions, uint8 (FP8 E4M3)
+      - v_cache:  scatter-written at out_loc positions, uint8 (FP8 E4M3)
 
-    Args:
-        qkv: combined QKV tensor, shape [num_tokens, (nq+nk+nv)*head_dim], dtype=bf16
-        num_heads_q/k/v: head counts
-        head_dim: per-head dimension (64, 128, or 256)
-        eps: RMSNorm epsilon
-        q_weight, k_weight: RMSNorm weight vectors [head_dim]
-        base: RoPE base frequency
-        is_neox: True for NeoX-style RoPE
-        position_ids: [num_tokens] int32
-        factor, low, high, attention_factor: YaRN parameters
-        rotary_dim: number of dimensions to apply rotation
-        k_cache, v_cache: KV cache buffers [max_tokens, kv_heads*head_dim] uint8
-        out_loc: cache slot indices [num_tokens] int32
-        k_scale, v_scale: FP8 quantization scales
+    Scales are float32 single-element tensors, default torch.ones(1).
     """
+    _default = lambda s: s if s is not None else torch.ones(1, dtype=torch.float32, device=qkv.device)
+    q_scale = _default(q_scale)
+    k_scale = _default(k_scale)
+    v_scale = _default(v_scale)
     mod = get_module()
     mod.fused_qk_norm_rope_store(
         qkv, num_heads_q, num_heads_k, num_heads_v, head_dim,
         eps, q_weight, k_weight, base, is_neox, position_ids,
         factor, low, high, attention_factor, rotary_dim,
+        q_output, q_scale,
         k_cache, v_cache, out_loc, k_scale, v_scale,
     )

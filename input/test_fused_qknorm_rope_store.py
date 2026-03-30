@@ -35,11 +35,13 @@ def reference_unfused(
     high: float,
     attention_factor: float,
     rotary_dim: int,
+    q_output: torch.Tensor,
+    q_scale: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     out_loc: torch.Tensor,
-    k_scale: float,
-    v_scale: float,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
 ):
     """
     Reference: existing fused_qk_norm_rope (in-place on qkv) + separate FP8 cast + store.
@@ -52,20 +54,24 @@ def reference_unfused(
         factor, low, high, attention_factor, rotary_dim,
     )
 
-    # Step 2: Split out K and V
+    # Step 2: Split out Q, K and V
     q_size = num_heads_q * head_dim
     kv_size = num_heads_k * head_dim
+    q = qkv[:, :q_size].clone()
     k = qkv[:, q_size:q_size + kv_size].clone()
     v = qkv[:, q_size + kv_size:].clone()
 
-    # Step 3: FP8 cast (matches memory_pool.py: div by scale, then .to(fp8))
+    # Step 3: FP8 cast (matches memory_pool.py: div by scale tensor, then .to(fp8))
+    q_fp8 = q.float().div(q_scale).to(torch.float8_e4m3fn)
     k_fp8 = k.float().div(k_scale).to(torch.float8_e4m3fn)
     v_fp8 = v.float().div(v_scale).to(torch.float8_e4m3fn)
 
     # Step 4: Reinterpret as uint8 and scatter write
+    q_u8 = q_fp8.view(torch.uint8).view(-1, q_size)
     k_u8 = k_fp8.view(torch.uint8).view(-1, kv_size)
     v_u8 = v_fp8.view(torch.uint8).view(-1, kv_size)
 
+    q_output.copy_(q_u8)
     num_tokens = qkv.shape[0]
     for i in range(num_tokens):
         slot = out_loc[i].item()
@@ -109,8 +115,12 @@ def test_fused_qknorm_rope_store(
 
     num_heads_q, num_heads_k, num_heads_v = num_heads_group
     hidden_size = (num_heads_q + num_heads_k + num_heads_v) * head_dim
+    q_dim = num_heads_q * head_dim
     kv_dim = num_heads_k * head_dim
-    v_scale = k_scale
+
+    q_scale = torch.tensor([k_scale], dtype=torch.float32, device=device)
+    k_scale_t = torch.tensor([k_scale], dtype=torch.float32, device=device)
+    v_scale_t = torch.tensor([k_scale], dtype=torch.float32, device=device)
 
     # Input tensors
     qkv_fused = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
@@ -119,6 +129,10 @@ def test_fused_qknorm_rope_store(
     position_ids = (torch.arange(num_tokens, device=device) + 100).to(torch.int32)
     q_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device) * 2.0
     k_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device) * 2.0
+
+    # Q output buffers
+    q_output_fused = torch.zeros(num_tokens, q_dim, dtype=torch.uint8, device=device)
+    q_output_ref = torch.zeros(num_tokens, q_dim, dtype=torch.uint8, device=device)
 
     # KV cache buffers
     k_cache_fused = torch.zeros(CACHE_SIZE, kv_dim, dtype=torch.uint8, device=device)
@@ -138,8 +152,9 @@ def test_fused_qknorm_rope_store(
         qkv_fused, num_heads_q, num_heads_k, num_heads_v, head_dim,
         eps, q_weight, k_weight, base, is_neox, position_ids,
         factor, low_f, high_f, attn_factor, rotary_dim,
+        q_output_fused, q_scale,
         k_cache_fused, v_cache_fused, out_loc,
-        k_scale, v_scale,
+        k_scale_t, v_scale_t,
     )
 
     # ---- Run reference (existing kernel + PyTorch FP8 cast + store) ----
@@ -147,19 +162,18 @@ def test_fused_qknorm_rope_store(
         qkv_ref, num_heads_q, num_heads_k, num_heads_v, head_dim,
         eps, q_weight, k_weight, base, is_neox, position_ids,
         factor, low_f, high_f, attn_factor, rotary_dim,
+        q_output_ref, q_scale,
         k_cache_ref, v_cache_ref, out_loc,
-        k_scale, v_scale,
+        k_scale_t, v_scale_t,
     )
 
-    # ---- Check Q output ----
-    q_size = num_heads_q * head_dim
-    q_fused = qkv_fused[:, :q_size]
-    q_ref = qkv_ref[:, :q_size]
-    torch.testing.assert_close(
-        q_fused, q_ref,
-        rtol=0, atol=0,
-        msg="Q output mismatch (should be identical)",
-    )
+    # ---- Check Q output (FP8 as uint8) ----
+    for i in range(num_tokens):
+        diff = (q_output_fused[i].int() - q_output_ref[i].int()).abs()
+        max_diff = diff.max().item()
+        assert max_diff <= 1, (
+            f"Q output mismatch at token {i}: max uint8 diff = {max_diff}"
+        )
 
     # ---- Check K cache ----
     for i in range(num_tokens):
@@ -194,11 +208,13 @@ def test_v_store_only():
     head_dim = 64
     num_tokens = 2
     hidden_size = (num_heads_q + num_heads_k + num_heads_v) * head_dim
+    q_dim = num_heads_q * head_dim
     kv_dim = num_heads_k * head_dim
 
     qkv = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
     v_section = qkv[:, (num_heads_q + num_heads_k) * head_dim:].clone()
 
+    q_output = torch.zeros(num_tokens, q_dim, dtype=torch.uint8, device=device)
     k_cache = torch.zeros(128, kv_dim, dtype=torch.uint8, device=device)
     v_cache = torch.zeros(128, kv_dim, dtype=torch.uint8, device=device)
     out_loc = torch.tensor([10, 50], dtype=torch.int32, device=device)
@@ -206,13 +222,14 @@ def test_v_store_only():
     position_ids = torch.tensor([0, 1], dtype=torch.int32, device=device)
     q_weight = torch.ones(head_dim, dtype=torch.bfloat16, device=device)
     k_weight = torch.ones(head_dim, dtype=torch.bfloat16, device=device)
-    v_scale = 1.0
+    v_scale = torch.ones(1, dtype=torch.float32, device=device)
 
     fused_qk_norm_rope_store(
         qkv, num_heads_q, num_heads_k, num_heads_v, head_dim,
         1e-5, q_weight, k_weight, 10000.0, True, position_ids,
         1.0, 0.0, 0.0, 1.0, head_dim,
-        k_cache, v_cache, out_loc, 1.0, v_scale,
+        q_output, None,
+        k_cache, v_cache, out_loc, None, v_scale,
     )
 
     # V path: bf16_value → float / v_scale → fp8
@@ -237,8 +254,11 @@ def test_large_batch():
     head_dim = 128
     num_tokens = 512
     hidden_size = (num_heads_q + num_heads_k + num_heads_v) * head_dim
+    q_dim = num_heads_q * head_dim
     kv_dim = num_heads_k * head_dim
-    k_scale = v_scale = 1.0
+    k_scale = torch.ones(1, dtype=torch.float32, device=device)
+    v_scale = torch.ones(1, dtype=torch.float32, device=device)
+    q_scale = torch.ones(1, dtype=torch.float32, device=device)
 
     qkv_fused = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
     qkv_ref = qkv_fused.clone()
@@ -247,6 +267,8 @@ def test_large_batch():
     q_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
     k_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
 
+    q_output_fused = torch.zeros(num_tokens, q_dim, dtype=torch.uint8, device=device)
+    q_output_ref = torch.zeros(num_tokens, q_dim, dtype=torch.uint8, device=device)
     k_cache_fused = torch.zeros(8192, kv_dim, dtype=torch.uint8, device=device)
     v_cache_fused = torch.zeros(8192, kv_dim, dtype=torch.uint8, device=device)
     k_cache_ref = torch.zeros(8192, kv_dim, dtype=torch.uint8, device=device)
@@ -258,6 +280,7 @@ def test_large_batch():
         qkv_fused, num_heads_q, num_heads_k, num_heads_v, head_dim,
         1e-5, q_weight, k_weight, 10000.0, True, position_ids,
         1.0, 0.0, 0.0, 1.0, head_dim,
+        q_output_fused, q_scale,
         k_cache_fused, v_cache_fused, out_loc, k_scale, v_scale,
     )
 
@@ -265,12 +288,14 @@ def test_large_batch():
         qkv_ref, num_heads_q, num_heads_k, num_heads_v, head_dim,
         1e-5, q_weight, k_weight, 10000.0, True, position_ids,
         1.0, 0.0, 0.0, 1.0, head_dim,
+        q_output_ref, q_scale,
         k_cache_ref, v_cache_ref, out_loc, k_scale, v_scale,
     )
 
-    # Q check
-    q_size = num_heads_q * head_dim
-    torch.testing.assert_close(qkv_fused[:, :q_size], qkv_ref[:, :q_size], rtol=0, atol=0)
+    # Q check (FP8 as uint8)
+    for i in range(num_tokens):
+        q_diff = (q_output_fused[i].int() - q_output_ref[i].int()).abs().max().item()
+        assert q_diff <= 1, f"Q mismatch token {i}: diff={q_diff}"
 
     # K/V check
     for i in range(num_tokens):
