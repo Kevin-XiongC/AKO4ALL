@@ -1461,6 +1461,60 @@ __global__ void allreduce_fusion_kernel_twoshot_polling(AllReduceFusionParams<T>
 #endif
 }
 
+// Fused full-reduce: like sglang CAR but with fused residual+RMSNorm.
+// Every rank reads ALL tokens from ALL peers and reduces locally.
+// No scatter-reduce, no allgather, only 1 barrier.
+// Optimal for small token counts (48-256) where allgather overhead dominates.
+template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
+__global__ void allreduce_fusion_kernel_full_reduce(AllReduceFusionParams<T> params) {
+  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+  IndexHelper<T> index_helper(params);
+  int token_id = index_helper.token_id;
+  int access_id_in_token = index_helper.access_id_in_token;
+  int token_stride = index_helper.token_stride;
+  int access_id = index_helper.access_id;
+  int access_stride = index_helper.access_stride;
+  int tot_access = index_helper.tot_access;
+  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+  SyncComm<NRanks> comm(params.workspace);
+
+  // Write-remote-read-local pattern (like sglang CAR):
+  // Each rank writes to ALL peers' comm_bufs (NVLink fire-and-forget),
+  // then reads from OWN comm_buf (local HBM, fast).
+  for (int idx = access_id; idx < tot_access; idx += access_stride) {
+    float4 val = reinterpret_cast<float4*>(params.allreduce_in)[idx];
+#pragma unroll
+    for (int r = 0; r < NRanks; ++r) {
+      reinterpret_cast<float4*>(comm.comm_bufs[r])[params.rank * tot_access + idx] = val;
+    }
+  }
+
+  Barrier<NRanks> barrier(params.rank, comm);
+  barrier.sync();
+
+  // Read from OWN comm_buf (local HBM) + reduce + fused_op.
+  for (int idx = access_id, tidx = token_id; idx < tot_access;
+       idx += access_stride, tidx += token_stride) {
+    vec_t<T, VEC_SIZE> vals[NRanks];
+#pragma unroll
+    for (int r = 0; r < NRanks; ++r) {
+      vals[r].load(reinterpret_cast<T*>(comm.comm_bufs[params.rank]) +
+                   (r * tot_access + idx) * VEC_SIZE);
+    }
+    vec_t<T, VEC_SIZE> sum_val = allreduce_sum<T, VEC_SIZE, NRanks, Fp32Acc>(vals);
+    fused_op.update(idx);
+    fused_op(sum_val, tidx);
+  }
+
+  comm.update(barrier.m_flag_value);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 int get_sm_count() {
   static int sm_count = 0;
   if (sm_count == 0) {
@@ -1510,6 +1564,15 @@ cudaError_t launch_twoshot_polling(AllReduceFusionParams<T> const& params, cudaL
   FLASHINFER_CUDA_CALL(
       cudaLaunchKernelEx(&cfg, allreduce_fusion_kernel_twoshot_polling<Pattern, T, NRanks, Fp32Acc>,
                          params, begin_tokens, token_num_per_ranks));
+  return cudaSuccess;
+}
+
+template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
+cudaError_t launch_full_reduce(AllReduceFusionParams<T> const& params,
+                               cudaLaunchConfig_t& cfg) {
+  FLASHINFER_CUDA_CALL(
+      cudaLaunchKernelEx(&cfg, allreduce_fusion_kernel_full_reduce<Pattern, T, NRanks, Fp32Acc>,
+                         params));
   return cudaSuccess;
 }
 
@@ -1669,13 +1732,21 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
           (launch_oneshot_lamport<Pattern, T, NRanks, Fp32Acc, false>(params, cfg)));
     }
   } else {
-    // Use polling twoshot for small token counts where barrier overhead dominates.
-    // Threshold: per-rank tokens <= 20 (token_num <= 160 for 8 GPUs).
-    bool use_polling = (token_num / NRanks <= 20);
-    if (use_polling) {
+    int token_per_rank = token_num / NRanks;
+    if (token_per_rank <= 8) {
+      // Tier 1 (token 48-64 for 8 GPUs): full-reduce.
+      // 1 copy + 1 barrier + full NVLink reads + fused_op. No allgather.
+      // Data small enough that NVLink read amplification (N×) is acceptable.
+      int fr_grid = std::min(sm_count, token_num);
+      cfg.gridDim = fr_grid;
+      FLASHINFER_CUDA_CALL((launch_full_reduce<Pattern, T, NRanks, Fp32Acc>(params, cfg)));
+    } else if (token_per_rank <= 20) {
+      // Tier 2 (token 72-160 for 8 GPUs): polling-twoshot.
+      // Eliminates barrier 1 with neg_zero polling. Scatter-reduce + allgather.
       FLASHINFER_CUDA_CALL((launch_twoshot_polling<Pattern, T, NRanks, Fp32Acc>(
           params, cfg, begin_tokens, token_num_per_ranks)));
     } else {
+      // Tier 3 (token 168+ for 8 GPUs): standard barrier-twoshot.
       FLASHINFER_CUDA_CALL((launch_twoshot_sync<Pattern, T, NRanks, Fp32Acc>(
           params, cfg, begin_tokens, token_num_per_ranks)));
     }
