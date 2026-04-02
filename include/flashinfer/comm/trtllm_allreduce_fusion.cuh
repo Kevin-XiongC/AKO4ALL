@@ -1732,21 +1732,35 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
           (launch_oneshot_lamport<Pattern, T, NRanks, Fp32Acc, false>(params, cfg)));
     }
   } else {
+    // Combined dispatch: use the best kernel for each token range.
+    // - Lamport oneshot: best for small tokens (no barrier, low latency)
+    // - Polling-twoshot: best for medium tokens (1 barrier, avoids Lamport scaling)
+    // - Barrier-twoshot: best for large tokens (2 barriers, optimal bandwidth)
+    //
+    // Crossover points (8 GPUs, hidden=5120):
+    //   oneshot wins up to ~token 80 (token_per_rank ~10)
+    //   polling-twoshot wins token 88-160 (token_per_rank 11-20)
+    //   barrier-twoshot wins token 168+ (token_per_rank > 20)
     int token_per_rank = token_num / NRanks;
-    if (token_per_rank <= 8) {
-      // Tier 1 (token 48-64 for 8 GPUs): full-reduce.
-      // 1 copy + 1 barrier + full NVLink reads + fused_op. No allgather.
-      // Data small enough that NVLink read amplification (N×) is acceptable.
-      int fr_grid = std::min(sm_count, token_num);
-      cfg.gridDim = fr_grid;
-      FLASHINFER_CUDA_CALL((launch_full_reduce<Pattern, T, NRanks, Fp32Acc>(params, cfg)));
+    if (token_per_rank <= 9) {
+      // Extend oneshot range: Lamport oneshot beats twoshot variants here.
+      // Recalculate grid for oneshot (1 block per token, not per-rank-token).
+      int oneshot_grid = (std::min(sm_count, token_num * (int)cluster_size) / (int)cluster_size) * (int)cluster_size;
+      cfg.gridDim = oneshot_grid;
+      bool trigger_completion_at_end = params.trigger_completion_at_end;
+      if (trigger_completion_at_end) {
+        FLASHINFER_CUDA_CALL(
+            (launch_oneshot_lamport<Pattern, T, NRanks, Fp32Acc, true>(params, cfg)));
+      } else {
+        FLASHINFER_CUDA_CALL(
+            (launch_oneshot_lamport<Pattern, T, NRanks, Fp32Acc, false>(params, cfg)));
+      }
     } else if (token_per_rank <= 20) {
-      // Tier 2 (token 72-160 for 8 GPUs): polling-twoshot.
-      // Eliminates barrier 1 with neg_zero polling. Scatter-reduce + allgather.
+      // Polling-twoshot: 1 barrier (neg_zero polling replaces barrier 1).
       FLASHINFER_CUDA_CALL((launch_twoshot_polling<Pattern, T, NRanks, Fp32Acc>(
           params, cfg, begin_tokens, token_num_per_ranks)));
     } else {
-      // Tier 3 (token 168+ for 8 GPUs): standard barrier-twoshot.
+      // Standard barrier-twoshot.
       FLASHINFER_CUDA_CALL((launch_twoshot_sync<Pattern, T, NRanks, Fp32Acc>(
           params, cfg, begin_tokens, token_num_per_ranks)));
     }
